@@ -43,12 +43,9 @@ htmlcov/
 .nox/
 
 # Sandbox Local Runtime & Storage
-.sandbox_ledger.db
-.sandbox_ledger.db-journal
-.sandbox_ledger.db-wal
-.sandbox_ledger.db-shm
-.workspaces/
-workspaces/
+**/.sandbox_ledger.db*
+**/.workspaces/
+**/workspaces/
 *.log
 
 # Environment variables
