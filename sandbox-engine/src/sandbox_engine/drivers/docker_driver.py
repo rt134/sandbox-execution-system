@@ -70,6 +70,17 @@ class DockerDriver(ContainerDriver):
             env["no_proxy"] = settings.no_proxy
             env["NO_PROXY"] = settings.no_proxy
 
+        target_network = settings.docker_network
+        if settings.docker_network_internal:
+            target_network = "sandbox-internal"
+            try:
+                self.client.networks.get("sandbox-internal")
+            except Exception:
+                try:
+                    self.client.networks.create("sandbox-internal", internal=True, driver="bridge")
+                except Exception:
+                    pass
+
         runtime = settings.docker_runtime
         kwargs = {
             "image": spec.image,
@@ -78,7 +89,7 @@ class DockerDriver(ContainerDriver):
             "environment": env,
             "volumes": volumes,
             "ports": ports,
-            "network": settings.docker_network,
+            "network": target_network,
             "pids_limit": spec.pids_limit,
             "cap_drop": ["ALL"],
             "security_opt": ["no-new-privileges:true"],
@@ -195,3 +206,14 @@ class DockerDriver(ContainerDriver):
                 except Exception:
                     await asyncio.sleep(0.1)
         return False
+
+    async def is_alive(self, sandbox_id: str) -> bool:
+        """Check if container exists and is actively running."""
+        return await asyncio.to_thread(self._sync_is_alive, sandbox_id)
+
+    def _sync_is_alive(self, sandbox_id: str) -> bool:
+        try:
+            c = self.client.containers.get(sandbox_id)
+            return c.status in ("running", "created")
+        except Exception:
+            return False

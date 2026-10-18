@@ -98,6 +98,26 @@ class LeaseBackend(ABC):
     async def count_active_locks(self) -> int:
         pass
 
+    @abstractmethod
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+        """
+        Registers or verifies tenant ownership of a workspace_id.
+        Returns: (is_owned_by_tenant, actual_owner_tenant_id)
+        """
+        pass
+
+    @abstractmethod
+    async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
+        pass
+
+    @abstractmethod
+    async def register_engine_heartbeat(self, engine_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        pass
+
 
 class SQLiteLeaseBackend(LeaseBackend):
     def __init__(self, db_path: str):
@@ -117,12 +137,17 @@ class SQLiteLeaseBackend(LeaseBackend):
                     created_at REAL,
                     expires_at REAL,
                     status TEXT,
-                    auth_token TEXT
+                    auth_token TEXT,
+                    tenant_id TEXT DEFAULT 'default'
                 )
                 """
             )
             try:
                 conn.execute("ALTER TABLE leases ADD COLUMN auth_token TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE leases ADD COLUMN tenant_id TEXT DEFAULT 'default'")
             except Exception:
                 pass
 
@@ -132,6 +157,23 @@ class SQLiteLeaseBackend(LeaseBackend):
                     workspace_id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     expires_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS engine_instances (
+                    engine_id TEXT PRIMARY KEY,
+                    last_heartbeat REAL NOT NULL
                 )
                 """
             )
@@ -377,6 +419,55 @@ class SQLiteLeaseBackend(LeaseBackend):
             row = cursor.fetchone()
             return row[0] if row else 0
 
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+        return await asyncio.to_thread(self._sync_claim_workspace, workspace_id, tenant_id)
+
+    def _sync_claim_workspace(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT tenant_id FROM workspaces WHERE workspace_id = ?", (workspace_id,))
+            row = cursor.fetchone()
+            if row:
+                return (row[0] == tenant_id, row[0])
+            cursor.execute(
+                "INSERT INTO workspaces (workspace_id, tenant_id, created_at) VALUES (?, ?, ?)",
+                (workspace_id, tenant_id, time.time()),
+            )
+            conn.commit()
+            return (True, tenant_id)
+
+    async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
+        return await asyncio.to_thread(self._sync_count_tenant_sessions, tenant_id)
+
+    def _sync_count_tenant_sessions(self, tenant_id: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count(*) FROM leases WHERE tenant_id = ? AND status = 'active'", (tenant_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def register_engine_heartbeat(self, engine_id: str) -> None:
+        await asyncio.to_thread(self._sync_register_engine, engine_id)
+
+    def _sync_register_engine(self, engine_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO engine_instances (engine_id, last_heartbeat) VALUES (?, ?)",
+                (engine_id, time.time()),
+            )
+            conn.commit()
+
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        return await asyncio.to_thread(self._sync_get_dead_engines, max_idle_sec)
+
+    def _sync_get_dead_engines(self, max_idle_sec: float) -> List[str]:
+        cutoff = time.time() - max_idle_sec
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT engine_id FROM engine_instances WHERE last_heartbeat < ?", (cutoff,))
+            rows = cursor.fetchall()
+            return [r[0] for r in rows]
+
 
 class RedisLeaseBackend(LeaseBackend):
     def __init__(self, redis_client):
@@ -590,6 +681,19 @@ class PostgresLeaseBackend(LeaseBackend):
                     created_at DOUBLE PRECISION NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_session ON session_audit_logs(session_id);
+
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    workspace_id VARCHAR(128) PRIMARY KEY,
+                    tenant_id VARCHAR(128) NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_workspaces_tenant ON workspaces(tenant_id);
+
+                CREATE TABLE IF NOT EXISTS engine_instances (
+                    engine_id VARCHAR(128) PRIMARY KEY,
+                    last_heartbeat DOUBLE PRECISION NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_engine_heartbeat ON engine_instances(last_heartbeat);
                 """
             )
 
@@ -896,6 +1000,54 @@ class PostgresLeaseBackend(LeaseBackend):
             count = await conn.fetchval("SELECT COUNT(*) FROM workspace_locks WHERE expires_at >= $1", now)
             return int(count or 0)
 
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+        now = time.time()
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT tenant_id FROM workspaces WHERE workspace_id = $1 FOR UPDATE",
+                    workspace_id,
+                )
+                if row:
+                    owner = row["tenant_id"]
+                    return (owner == tenant_id, owner)
+                await conn.execute(
+                    "INSERT INTO workspaces (workspace_id, tenant_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (workspace_id) DO NOTHING",
+                    workspace_id,
+                    tenant_id,
+                    now,
+                )
+                return (True, tenant_id)
+
+    async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT count(*) FROM leases WHERE tenant_id = $1 AND status = 'active'",
+                tenant_id,
+            )
+            return int(val or 0)
+
+    async def register_engine_heartbeat(self, engine_id: str) -> None:
+        now = time.time()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO engine_instances (engine_id, last_heartbeat) VALUES ($1, $2)
+                ON CONFLICT (engine_id) DO UPDATE SET last_heartbeat = EXCLUDED.last_heartbeat
+                """,
+                engine_id,
+                now,
+            )
+
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        cutoff = time.time() - max_idle_sec
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT engine_id FROM engine_instances WHERE last_heartbeat < $1",
+                cutoff,
+            )
+            return [r["engine_id"] for r in rows]
+
 
 class LeaseManager:
     """
@@ -1044,3 +1196,22 @@ class LeaseManager:
 
     async def count_active_locks(self) -> int:
         return await self._backend.count_active_locks()
+
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+        if hasattr(self._backend, "claim_workspace_ownership"):
+            return await self._backend.claim_workspace_ownership(workspace_id, tenant_id)
+        return (True, tenant_id)
+
+    async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
+        if hasattr(self._backend, "count_active_sessions_for_tenant"):
+            return await self._backend.count_active_sessions_for_tenant(tenant_id)
+        return 0
+
+    async def register_engine_heartbeat(self, engine_id: str) -> None:
+        if hasattr(self._backend, "register_engine_heartbeat"):
+            await self._backend.register_engine_heartbeat(engine_id)
+
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        if hasattr(self._backend, "get_dead_engines"):
+            return await self._backend.get_dead_engines(max_idle_sec)
+        return []

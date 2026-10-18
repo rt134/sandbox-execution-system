@@ -51,8 +51,35 @@ async def acquire_session(
     workspace_id = payload.workspace_id
     ttl = payload.ttl_seconds or settings.default_session_ttl
 
-    # Security: Strict validation against directory traversal (e.g. '../..', '/')
-    workspace_dir = validate_workspace_id(workspace_id, settings.workspaces_root)
+    # Quota Guard: Enforce maximum session TTL limit
+    if ttl > settings.max_session_ttl:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested TTL ({ttl}s) exceeds maximum allowed limit ({settings.max_session_ttl}s)",
+        )
+
+    tenant_id = getattr(request.state, "tenant_id", "default")
+
+    # Multi-Tenant Ownership Guard: Verify that workspace_id is owned by caller's tenant
+    is_owner, current_owner = await lease_mgr.claim_workspace_ownership(workspace_id, tenant_id)
+    if not is_owner:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access denied: workspace '{workspace_id}' is owned by another tenant",
+        )
+
+    # Tenant Quota Guard: Check concurrent active session limit per tenant
+    existing = await lease_mgr.get(session_id)
+    if not (existing and existing.status == "active"):
+        active_count = await lease_mgr.count_active_sessions_for_tenant(tenant_id)
+        if active_count >= settings.max_concurrent_sessions_per_tenant:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Tenant concurrent session quota exceeded ({active_count}/{settings.max_concurrent_sessions_per_tenant} active sessions)",
+            )
+
+    # Security: Strict validation against directory traversal strictly scoped to tenant directory
+    workspace_dir = validate_workspace_id(workspace_id, settings.workspaces_root, tenant_id=tenant_id)
 
     # Concurrency Lock: Ensure workspace is not held by another active session
     acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
@@ -74,9 +101,7 @@ async def acquire_session(
         )
 
     try:
-        tenant_id = getattr(request.state, "tenant_id", "default")
         # Check for existing active lease to reattach
-        existing = await lease_mgr.get(session_id)
         if existing and existing.status == "active":
             if existing.tenant_id and existing.tenant_id != tenant_id:
                 raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
@@ -263,9 +288,13 @@ async def proxy_exec(
         keepalive_task = asyncio.create_task(keepalive_loop())
 
         async def stream_generator():
+            total_bytes = 0
             try:
                 async with client.stream("POST", f"{endpoint}/exec", json=body, headers=headers) as r:
                     async for chunk in r.aiter_bytes():
+                        total_bytes += len(chunk)
+                        if total_bytes > settings.max_stream_response_bytes:
+                            break
                         yield chunk
             finally:
                 stop_keepalive.set()

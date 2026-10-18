@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import time
 from typing import Dict, List, Optional
@@ -96,17 +97,25 @@ class KubernetesDriver(ContainerDriver):
         normalized_mem = normalize_k8s_mem(spec.mem_limit)
 
         # Volume mounts for stateful sandboxes
-        pod_volumes = []
-        volume_mounts = []
+        pod_volumes = [
+            client.V1Volume(name="tmp-dir", empty_dir=client.V1EmptyDirVolumeSource())
+        ]
+        volume_mounts = [
+            client.V1VolumeMount(name="tmp-dir", mount_path="/tmp")
+        ]
         if spec.workspace_path:
             vol_name = "workspace-volume"
             workspace_id = spec.labels.get("sandbox.workspace_id") or clean_id
-            clean_ws_id = re.sub(r"[^a-z0-9\-]", "-", workspace_id.lower()).strip("-")[:40]
-            pvc_name = f"pvc-ws-{clean_ws_id}"
+            tenant_id = spec.labels.get("sandbox.tenant_id") or "default"
+
+            # Cryptographic collision-proof hashing: scoped to tenant_id and workspace_id
+            scope_key = f"{tenant_id}:{workspace_id}"
+            scope_hash = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+            pvc_name = f"pvc-{scope_hash}"
 
             if settings.k8s_use_pvc:
-                # Key PVC by workspace_id and ensure it exists dynamically
-                await self._ensure_workspace_pvc(namespace, pvc_name, workspace_id, spec.disk_quota_mb)
+                # Key PVC by (tenant_id, workspace_id) hash and ensure it exists dynamically
+                await self._ensure_workspace_pvc(namespace, pvc_name, workspace_id, tenant_id, spec.disk_quota_mb)
                 volume = client.V1Volume(
                     name=vol_name,
                     persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
@@ -121,10 +130,14 @@ class KubernetesDriver(ContainerDriver):
             pod_volumes.append(volume)
             volume_mounts.append(client.V1VolumeMount(name=vol_name, mount_path="/workspace"))
 
-        # Security context: drop all capabilities, no privilege escalation
+        # Hardened Security Context: drop all capabilities, no privilege escalation, read-only root, non-root user
         sec_context = client.V1SecurityContext(
             allow_privilege_escalation=False,
             capabilities=client.V1Capabilities(drop=["ALL"]),
+            read_only_root_filesystem=True,
+            run_as_non_root=True,
+            run_as_user=1000,
+            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
 
         container = client.V1Container(
@@ -255,9 +268,11 @@ class KubernetesDriver(ContainerDriver):
                     await asyncio.sleep(0.1)
         return False
 
-    async def _ensure_workspace_pvc(self, namespace: str, pvc_name: str, workspace_id: str, quota_mb: int) -> None:
+    async def _ensure_workspace_pvc(
+        self, namespace: str, pvc_name: str, workspace_id: str, tenant_id: str, quota_mb: int
+    ) -> None:
         """
-        Dynamically provisions a Kubernetes PersistentVolumeClaim keyed by workspace_id
+        Dynamically provisions a Kubernetes PersistentVolumeClaim keyed by (tenant_id, workspace_id)
         if it does not already exist.
         """
         await self._init_client()
@@ -278,7 +293,9 @@ class KubernetesDriver(ContainerDriver):
                 namespace=namespace,
                 labels={
                     "sandbox.managed": "true",
+                    "sandbox.tenant_id": str(tenant_id),
                     "sandbox.workspace_id": str(workspace_id),
+                    "sandbox.created_at": str(int(time.time())),
                 },
             ),
             spec=client.V1PersistentVolumeClaimSpec(
@@ -297,3 +314,14 @@ class KubernetesDriver(ContainerDriver):
         except ApiException as create_err:
             if create_err.status != 409:  # Conflict / already created concurrently is fine
                 raise
+
+    async def is_alive(self, sandbox_id: str) -> bool:
+        """Checks if Pod exists and is running."""
+        await self._init_client()
+        try:
+            pod = await self._core_api.read_namespaced_pod(name=sandbox_id, namespace=settings.k8s_namespace)
+            return pod.status.phase in ("Running", "Pending")
+        except ApiException as e:
+            if e.status == 404:
+                return False
+            raise

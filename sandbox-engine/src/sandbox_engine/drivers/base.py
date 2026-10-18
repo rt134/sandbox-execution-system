@@ -35,3 +35,8 @@ class ContainerDriver(ABC):
     async def healthcheck(self, endpoint: str) -> bool:
         """Probe the sandbox's shellctl /health endpoint."""
         pass
+
+    @abstractmethod
+    async def is_alive(self, sandbox_id: str) -> bool:
+        """Check if container or pod is actively running."""
+        pass

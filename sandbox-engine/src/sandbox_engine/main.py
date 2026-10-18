@@ -81,6 +81,15 @@ app.add_middleware(
 )
 
 
+import asyncio
+import time
+from typing import Dict, List
+
+# Sliding-window per-tenant rate limiter
+_tenant_request_history: Dict[str, List[float]] = {}
+_rate_limit_lock = asyncio.Lock()
+
+
 @app.middleware("http")
 async def limit_request_size(request: Request, call_next):
     """Enforce strict request body size limit (25MB) to prevent memory exhaustion attacks."""
@@ -95,6 +104,36 @@ async def limit_request_size(request: Request, call_next):
                 )
         except ValueError:
             pass
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Enforce sliding-window per-tenant request rate limiting."""
+    # Health and readiness probes bypass rate limiting
+    if request.url.path in ("/healthz", "/readyz"):
+        return await call_next(request)
+
+    raw_tenant = request.headers.get("x-tenant-id", "default").strip()
+    tenant_id = raw_tenant if raw_tenant else "default"
+
+    now = time.time()
+    cutoff = now - 60.0
+
+    async with _rate_limit_lock:
+        history = _tenant_request_history.setdefault(tenant_id, [])
+        # Retain timestamps within the last 60 seconds
+        active_window = [ts for ts in history if ts > cutoff]
+        _tenant_request_history[tenant_id] = active_window
+        if len(active_window) >= settings.rate_limit_requests_per_minute:
+            return Response(
+                content='{"detail": "Too Many Requests: rate limit exceeded for tenant"}',
+                status_code=429,
+                headers={"Retry-After": "60"},
+                media_type="application/json",
+            )
+        _tenant_request_history[tenant_id].append(now)
+
     return await call_next(request)
 
 

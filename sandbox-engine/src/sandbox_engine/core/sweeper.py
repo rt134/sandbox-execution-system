@@ -86,9 +86,44 @@ class Sweeper:
         # 2. Reconcile any orphaned workspace locks
         await self.lease_manager.cleanup_expired_workspace_locks()
 
-        # 3. Orphan stateful container garbage collection
+        # 3. Dead Container Reconciliation: Check active leases whose container has crashed/exited
+        active_leases = await self.lease_manager.list_active()
+        for lease in active_leases:
+            if lease.sandbox_id:
+                try:
+                    alive = await self.driver.is_alive(lease.sandbox_id)
+                    if not alive:
+                        logger.warning(f"🧹 [Sweeper] Detected dead/missing container '{lease.sandbox_id}' for active session '{lease.session_id}'. Reconciling...")
+                        await self.lease_manager.mark_expired(lease.session_id)
+                        if lease.workspace_id:
+                            await self.lease_manager.release_workspace_lock(lease.workspace_id, lease.session_id)
+                        SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
+                except Exception as e:
+                    logger.error(f"Failed to check liveness of container {lease.sandbox_id}: {e}")
+
+        # 4. Engine Heartbeat & Dead Engine Warm Container Garbage Collection
+        current_engine_id = self.warm_pool.engine_id if self.warm_pool else settings.engine_instance_id
+        await self.lease_manager.register_engine_heartbeat(current_engine_id)
+
         try:
-            active_leases = await self.lease_manager.list_active()
+            dead_engines = await self.lease_manager.get_dead_engines(max_idle_sec=60.0)
+            for dead_id in dead_engines:
+                if dead_id != current_engine_id:
+                    dead_warm = await self.driver.list_sandboxes(
+                        labels={"sandbox.pool": "warm", "sandbox.engine_id": dead_id}
+                    )
+                    for sbx in dead_warm:
+                        logger.warning(f"🧹 [Sweeper] Reaping warm container '{sbx.sandbox_id}' from dead engine replica '{dead_id}'...")
+                        try:
+                            await self.driver.destroy_sandbox(sbx.sandbox_id)
+                            SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_engine_warm_reaped").inc()
+                        except Exception as e:
+                            logger.error(f"Failed to reap sandbox {sbx.sandbox_id} from dead engine: {e}")
+        except Exception as e:
+            logger.error(f"Failed to check dead engines: {e}")
+
+        # 5. Orphan stateful container garbage collection
+        try:
             active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id}
 
             running_sandboxes = await self.driver.list_sandboxes(labels={"sandbox.type": "stateful"})
@@ -106,7 +141,7 @@ class Sweeper:
                     except Exception as e:
                         logger.error(f"Failed to destroy orphan container {sbx.sandbox_id}: {e}")
 
-            # 4. Orphan warm pool container garbage collection (reclaimed if this engine replica crashed)
+            # 6. Orphan warm pool container garbage collection (reclaimed if this engine replica crashed)
             if self.warm_pool is not None:
                 tracked_pool_ids = self.warm_pool.get_active_ids()
                 # Multi-replica safe: only inspect warm containers created by this replica's engine_id!

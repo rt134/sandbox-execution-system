@@ -4,6 +4,7 @@ import time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..config import settings
 from ..core.metrics import STATELESS_DURATION_SECONDS, STATELESS_RUNS_TOTAL
 from ..core.security import verify_api_key
 from ..core.warm_pool import WarmPoolManager
@@ -27,6 +28,13 @@ async def run_stateless_code(
     """
     Execute stateless code with sub-50ms SLA using the pre-warmed container pool.
     """
+    # Enforce maximum timeout limit to prevent worker starvation
+    if payload.timeout > settings.max_stateless_timeout:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Requested timeout ({payload.timeout}s) exceeds maximum allowed limit ({settings.max_stateless_timeout}s)",
+        )
+
     start_time = time.perf_counter()
     status = "error"
 
