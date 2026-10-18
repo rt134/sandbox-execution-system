@@ -997,9 +997,20 @@ class LeaseManager:
             return await self._backend.claim_expired_leases(now)
         return await self._backend.get_expired_leases()
 
-    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
+    async def log_audit_event(
+        self,
+        session_id: str,
+        event_type: str = "custom",
+        details: Optional[dict] = None,
+        workspace_id: str = "",
+    ):
         if hasattr(self._backend, "log_audit_event"):
-            await self._backend.log_audit_event(session_id, workspace_id, event_type, details)
+            await self._backend.log_audit_event(
+                session_id=session_id,
+                event_type=event_type,
+                details=details,
+                workspace_id=workspace_id,
+            )
 
     async def mark_expired(self, session_id: str) -> None:
         await self._backend.mark_expired(session_id)
