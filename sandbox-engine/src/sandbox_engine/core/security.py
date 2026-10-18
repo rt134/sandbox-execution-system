@@ -42,11 +42,18 @@ def decrypt_token(encrypted_token: Optional[str]) -> Optional[str]:
         return encrypted_token
 
 
-def validate_workspace_id(workspace_id: str, workspaces_root: Optional[str] = None) -> str:
+import json
+
+
+def validate_workspace_id(
+    workspace_id: str,
+    workspaces_root: Optional[str] = None,
+    tenant_id: str = "default",
+) -> str:
     """
     Validates workspace_id against strict regex (no trailing newlines) and guarantees
-    path canonicalization within workspaces_root.
-    Also ensures directory permissions allow UID 1000 to read/write.
+    path canonicalization strictly within a tenant-scoped directory.
+    Eliminates cross-tenant workspace file sharing and directory traversal.
     """
     if not workspace_id or not isinstance(workspace_id, str):
         raise HTTPException(
@@ -68,16 +75,18 @@ def validate_workspace_id(workspace_id: str, workspaces_root: Optional[str] = No
             detail=f"Invalid workspace_id '{workspace_id}'. Must match pattern '^[a-zA-Z0-9_\\-]{{1,64}}$'",
         )
 
-    # 2. Path Traversal Defense: canonical path resolution
+    # 2. Path Traversal & Multi-Tenant Defense: tenant-scoped directory isolation
+    tenant_slug = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:16]
     root = os.path.realpath(os.path.abspath(workspaces_root or settings.workspaces_root))
-    target_path = os.path.realpath(os.path.abspath(os.path.join(root, workspace_id)))
+    tenant_root = os.path.realpath(os.path.abspath(os.path.join(root, f"tenant_{tenant_slug}")))
+    target_path = os.path.realpath(os.path.abspath(os.path.join(tenant_root, workspace_id)))
 
-    # Ensure target path is strictly a sub-path of root
-    expected_prefix = root if root.endswith(os.sep) else root + os.sep
+    # Ensure target path is strictly inside tenant_root
+    expected_prefix = tenant_root if tenant_root.endswith(os.sep) else tenant_root + os.sep
     if not target_path.startswith(expected_prefix):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Security violation: workspace path escapes allowed root directory",
+            detail="Security violation: workspace path escapes allowed tenant root directory",
         )
 
     # 3. Ensure host workspace directory exists and has 0o777 permissions
@@ -104,9 +113,12 @@ async def verify_api_key(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(security_bearer),
 ) -> str:
     """
-    Validates caller API Key against SANDBOX_API_KEY.
-    In production mode, refuses to run if API key is not configured.
-    Enforces tenant identification via X-Tenant-ID or API key binding.
+    Validates caller API Key against SANDBOX_API_KEY or per-tenant keys.
+    In production mode:
+      - Refuses to run if API key is not configured.
+      - Strictly forbids passing credentials via query parameters.
+      - Mandates X-Tenant-ID header (rejects 'default').
+      - Validates per-tenant key binding if configured.
     """
     is_prod = settings.environment.lower() in ("production", "prod")
     expected_key = settings.api_key
@@ -117,13 +129,46 @@ async def verify_api_key(
             detail="Server configuration error: SANDBOX_API_KEY must be set in production mode",
         )
 
+    # In production, query parameter token is strictly forbidden (prevents URL leakage)
+    if is_prod and "token" in request.query_params:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Security violation: API token in URL query parameter is forbidden in production mode",
+        )
+
     provided_key: Optional[str] = None
     if credentials and credentials.credentials:
         provided_key = credentials.credentials
     elif "x-api-key" in request.headers:
         provided_key = request.headers["x-api-key"]
-    elif "token" in request.query_params:
+    elif not is_prod and "token" in request.query_params:
         provided_key = request.query_params["token"]
+
+    # Resolve and validate Tenant Identity
+    raw_tenant = request.headers.get("x-tenant-id", "").strip()
+    if is_prod:
+        if not raw_tenant or raw_tenant.lower() == "default":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Header 'X-Tenant-ID' is required in production and cannot be 'default'",
+            )
+        tenant_id = raw_tenant
+    else:
+        tenant_id = raw_tenant if raw_tenant else "default"
+
+    # Per-tenant key validation if tenant_keys_json is configured
+    if settings.tenant_keys_json:
+        try:
+            tenant_key_map = json.loads(settings.tenant_keys_json)
+            if tenant_id in tenant_key_map:
+                expected_key = tenant_key_map[tenant_id]
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Tenant '{tenant_id}' is not authorized or key mapping is missing",
+                )
+        except json.JSONDecodeError:
+            pass
 
     if expected_key:
         if not provided_key or not secrets.compare_digest(provided_key, expected_key):
@@ -132,11 +177,6 @@ async def verify_api_key(
                 detail="Unauthorized: invalid or missing Sandbox API key",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-
-    # Resolve Tenant Identity
-    tenant_id = request.headers.get("x-tenant-id", "default").strip()
-    if not tenant_id:
-        tenant_id = "default"
 
     request.state.tenant_id = tenant_id
     return tenant_id

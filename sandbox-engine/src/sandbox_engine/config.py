@@ -17,17 +17,28 @@ class EngineSettings(BaseSettings):
     # Core Execution Driver
     driver: Literal["docker", "k8s"] = "docker"
 
-    # Engine Replica Instance ID (prevents cross-replica sweeper interference)
-    engine_instance_id: str = Field(default_factory=lambda: secrets.token_hex(4))
+    # Engine Replica Instance ID (uses stable HOSTNAME/POD_NAME if present, otherwise random)
+    engine_instance_id: str = Field(
+        default_factory=lambda: os.environ.get("HOSTNAME") or os.environ.get("POD_NAME") or secrets.token_hex(4)
+    )
 
     # Container Images
     image: str = "sandbox-base:latest"
 
     # Authentication & Security
     api_key: Optional[str] = None  # Caller -> Engine Bearer token / X-API-Key
+    tenant_keys_json: Optional[str] = os.environ.get("SANDBOX_TENANT_KEYS_JSON")  # Optional tenant-specific keys
     encryption_key: str = os.environ.get("SANDBOX_ENCRYPTION_KEY", "sandbox-default-secret-key-change-in-prod-32bytes")
     cors_allowed_origins: List[str] = ["*"]
     max_request_size_bytes: int = 25 * 1024 * 1024  # 25MB request body cap
+    max_stream_response_bytes: int = 50 * 1024 * 1024  # 50MB max streaming response
+    max_ws_message_size_bytes: int = 1024 * 1024  # 1MB max WebSocket message
+
+    # Per-Tenant Quotas & Limits
+    max_session_ttl: int = 7200  # Max 2 hours session duration
+    max_stateless_timeout: float = 60.0  # Max 60 seconds execution timeout
+    max_concurrent_sessions_per_tenant: int = 10  # Max active sessions per tenant
+    rate_limit_requests_per_minute: int = 120  # Rate limit per tenant
 
     # Pool Configurations (Stateless)
     warm_pool_size: int = 2
@@ -47,7 +58,7 @@ class EngineSettings(BaseSettings):
     default_session_ttl: int = 300
     sweeper_interval_sec: float = 5.0
     orphan_grace_period_sec: float = 60.0  # Prevent sweeper race on freshly created containers
-    workspaces_root: str = os.path.abspath(".workspaces")
+    workspaces_root: str = os.environ.get("SANDBOX_WORKSPACES_ROOT", os.path.abspath(".workspaces"))
     redis_url: Optional[str] = None  # Optional secondary cache/coordination
     sqlite_path: str = ".sandbox_ledger.db"
     require_redis: bool = False  # If True, refuse silent fallback
@@ -72,18 +83,49 @@ class EngineSettings(BaseSettings):
     def validate_production_settings(self):
         """
         Validates that production environment has mandatory security configurations.
-        Fails fast if auth or persistence is missing.
+        Fails fast if auth, persistence, or encryption keys are missing, weak, or default placeholders.
         """
         if self.environment.lower() in ("production", "prod"):
+            # 1. API Key Validation
             if not self.api_key:
                 raise ValueError(
                     "Production environment requires SANDBOX_API_KEY to be set! "
                     "Refusing to start engine in fail-open unauthenticated mode."
                 )
+            if len(self.api_key) < 32:
+                raise ValueError(
+                    f"Production SANDBOX_API_KEY is too short ({len(self.api_key)} chars). Must be at least 32 characters."
+                )
+            weak_patterns = ["change-in-prod", "replace-me", "default-secret", "secret-key", "sandbox-default", "12345", "password", "admin"]
+            for wp in weak_patterns:
+                if wp in self.api_key.lower():
+                    raise ValueError(
+                        f"Production SANDBOX_API_KEY contains known insecure placeholder '{wp}'. Must set a real secret."
+                    )
+
+            # 2. Encryption Key Validation
+            if not self.encryption_key or len(self.encryption_key) < 32:
+                raise ValueError(
+                    "Production requires a strong SANDBOX_ENCRYPTION_KEY of at least 32 characters for token encryption at rest."
+                )
+            for wp in weak_patterns:
+                if wp in self.encryption_key.lower():
+                    raise ValueError(
+                        f"Production SANDBOX_ENCRYPTION_KEY contains known insecure placeholder '{wp}'. Must set a real secret."
+                    )
+
+            # 3. Database URL Validation
             if not self.postgres_url:
                 raise ValueError(
                     "Production environment requires PostgreSQL database URL! "
                     "Please set SANDBOX_POSTGRES_URL, POSTGRES_URL, or DATABASE_URL in your environment."
+                )
+
+            # 4. Driver & Runtime Isolation Validation
+            if self.driver == "docker" and self.docker_runtime == "runc" and not os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION"):
+                raise ValueError(
+                    "Production environment refuses to use standard 'runc' driver without strong isolation (gVisor 'runsc'). "
+                    "Set SANDBOX_DOCKER_RUNTIME=runsc or set ALLOW_INSECURE_DOCKER_PRODUCTION=1 for testing."
                 )
 
     # Egress Proxy Configurations (Squid)
