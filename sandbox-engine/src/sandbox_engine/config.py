@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import secrets
 from typing import List, Literal, Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,13 +17,17 @@ class EngineSettings(BaseSettings):
     # Core Execution Driver
     driver: Literal["docker", "k8s"] = "docker"
 
+    # Engine Replica Instance ID (prevents cross-replica sweeper interference)
+    engine_instance_id: str = Field(default_factory=lambda: secrets.token_hex(4))
+
     # Container Images
     image: str = "sandbox-base:latest"
 
     # Authentication & Security
     api_key: Optional[str] = None  # Caller -> Engine Bearer token / X-API-Key
-    daemon_auth_token: Optional[str] = None  # Engine -> Daemon internal shared secret
+    encryption_key: str = os.environ.get("SANDBOX_ENCRYPTION_KEY", "sandbox-default-secret-key-change-in-prod-32bytes")
     cors_allowed_origins: List[str] = ["*"]
+    max_request_size_bytes: int = 25 * 1024 * 1024  # 25MB request body cap
 
     # Pool Configurations (Stateless)
     warm_pool_size: int = 2
@@ -63,6 +69,23 @@ class EngineSettings(BaseSettings):
 
         return self.default_local_postgres_url
 
+    def validate_production_settings(self):
+        """
+        Validates that production environment has mandatory security configurations.
+        Fails fast if auth or persistence is missing.
+        """
+        if self.environment.lower() in ("production", "prod"):
+            if not self.api_key:
+                raise ValueError(
+                    "Production environment requires SANDBOX_API_KEY to be set! "
+                    "Refusing to start engine in fail-open unauthenticated mode."
+                )
+            if not self.postgres_url:
+                raise ValueError(
+                    "Production environment requires PostgreSQL database URL! "
+                    "Please set SANDBOX_POSTGRES_URL, POSTGRES_URL, or DATABASE_URL in your environment."
+                )
+
     # Egress Proxy Configurations (Squid)
     http_proxy: Optional[str] = None
     https_proxy: Optional[str] = None
@@ -72,6 +95,7 @@ class EngineSettings(BaseSettings):
     docker_runtime: str = "runc"  # 'runc' for local dev, 'runsc' for gVisor production
     allow_runtime_fallback: bool = False  # Fail hard if requested secure runtime is unavailable!
     docker_network: str = "bridge"
+    docker_network_internal: bool = False  # Set to True for internal network with no direct host egress
     docker_host_port_start: int = 15000
 
     # Kubernetes Specific Settings
