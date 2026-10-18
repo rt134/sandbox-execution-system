@@ -49,6 +49,29 @@ func getWorkspaceRoot() string {
 	return cleanRoot
 }
 
+func getWorkspaceDiskQuota() int64 {
+	quotaMB := 1024 // Default 1024 MB
+	if val := os.Getenv("WORKSPACE_DISK_QUOTA_MB"); val != "" {
+		var n int
+		if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n > 0 {
+			quotaMB = n
+		}
+	}
+	return int64(quotaMB) * 1024 * 1024
+}
+
+func getWorkspaceDiskUsage() int64 {
+	root := getWorkspaceRoot()
+	var totalSize int64
+	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	return totalSize
+}
+
 // sanitizePath ensures path does not escape workspace directory
 func sanitizePath(userPath string) (string, error) {
 	root := getWorkspaceRoot()

@@ -60,9 +60,8 @@ flowchart TD
 ```text
 sandbox-execution-system/
 ├── product-details.md             # Full architectural specification
-├── implementation-plan.md         # 4-phase roadmap & exit verification
 │
-├── daemon/                        # Phase 1: In-sandbox execution kernel
+├── daemon/                        # In-sandbox execution kernel
 │   ├── go.mod                     # Go 1.22 static binary (<8MB RAM)
 │   ├── main.go                    # shellctl server listening on :5004
 │   ├── Dockerfile                 # Multi-stage container base image
@@ -70,7 +69,7 @@ sandbox-execution-system/
 │   ├── runner/python_runner.py    # Sub-50ms stateless code runner
 │   └── handlers/                  # Health, Execute, Exec, PTY, and FS APIs
 │
-├── sandbox-engine/                # Phase 2 & 3: FastAPI Control Plane
+├── sandbox-engine/                # FastAPI Control Plane
 │   ├── pyproject.toml
 │   ├── src/sandbox_engine/
 │   │   ├── config.py              # Settings (SANDBOX_DRIVER, REDIS_URL, etc.)
@@ -81,7 +80,7 @@ sandbox-execution-system/
 │   │   └── main.py                # FastAPI app with async lifespan
 │   └── tests/                     # Benchmarks & stateful test suites
 │
-├── sandbox-client/                # Phase 4: Async Python SDK
+├── sandbox-client/                # Async Python SDK
 │   ├── pyproject.toml
 │   ├── src/sandbox_client/
 │   │   ├── client.py              # SandboxClient entrypoint
