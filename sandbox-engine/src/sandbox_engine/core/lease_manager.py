@@ -58,7 +58,13 @@ class LeaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
+    async def log_audit_event(
+        self,
+        session_id: str,
+        event_type: str = "custom",
+        details: Optional[dict] = None,
+        workspace_id: str = "",
+    ):
         pass
 
     # Concurrency Lock APIs
@@ -788,15 +794,21 @@ class PostgresLeaseBackend(LeaseBackend):
                 for r in rows
             ]
 
-    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
+    async def log_audit_event(
+        self,
+        session_id: str,
+        event_type: str = "custom",
+        details: Optional[dict] = None,
+        workspace_id: str = "",
+    ):
         now = time.time()
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES ($1, $2, $3, $4, $5)",
                 session_id,
-                workspace_id,
+                workspace_id or "",
                 event_type,
-                json.dumps(details),
+                json.dumps(details or {}),
                 now,
             )
 
