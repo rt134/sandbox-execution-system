@@ -100,11 +100,17 @@ class KubernetesDriver(ContainerDriver):
         volume_mounts = []
         if spec.workspace_path:
             vol_name = "workspace-volume"
+            workspace_id = spec.labels.get("sandbox.workspace_id") or clean_id
+            clean_ws_id = re.sub(r"[^a-z0-9\-]", "-", workspace_id.lower()).strip("-")[:40]
+            pvc_name = f"pvc-ws-{clean_ws_id}"
+
             if settings.k8s_use_pvc:
+                # Key PVC by workspace_id and ensure it exists dynamically
+                await self._ensure_workspace_pvc(namespace, pvc_name, workspace_id, spec.disk_quota_mb)
                 volume = client.V1Volume(
                     name=vol_name,
                     persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                        claim_name=f"pvc-{clean_id}"
+                        claim_name=pvc_name
                     ),
                 )
             else:
@@ -248,3 +254,46 @@ class KubernetesDriver(ContainerDriver):
                 except Exception:
                     await asyncio.sleep(0.1)
         return False
+
+    async def _ensure_workspace_pvc(self, namespace: str, pvc_name: str, workspace_id: str, quota_mb: int) -> None:
+        """
+        Dynamically provisions a Kubernetes PersistentVolumeClaim keyed by workspace_id
+        if it does not already exist.
+        """
+        await self._init_client()
+        try:
+            await self._core_api.read_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace,
+            )
+            return  # PVC already exists and is bound to this workspace
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+        # PVC not found, dynamically create it
+        pvc = client.V1PersistentVolumeClaim(
+            metadata=client.V1ObjectMeta(
+                name=pvc_name,
+                namespace=namespace,
+                labels={
+                    "sandbox.managed": "true",
+                    "sandbox.workspace_id": str(workspace_id),
+                },
+            ),
+            spec=client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteOnce"],
+                resources=client.V1ResourceRequirements(
+                    requests={"storage": f"{quota_mb}Mi"}
+                ),
+                storage_class_name=settings.k8s_storage_class,
+            ),
+        )
+        try:
+            await self._core_api.create_namespaced_persistent_volume_claim(
+                namespace=namespace,
+                body=pvc,
+            )
+        except ApiException as create_err:
+            if create_err.status != 409:  # Conflict / already created concurrently is fine
+                raise

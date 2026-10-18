@@ -104,6 +104,7 @@ class EngineSettings(BaseSettings):
     k8s_node_selector_key: str = "sandbox"
     k8s_node_selector_value: str = "true"
     k8s_use_pvc: bool = False
+    k8s_storage_class: Optional[str] = None
 
     # Engine Server Settings
     host: str = "0.0.0.0"

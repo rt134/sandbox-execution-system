@@ -17,6 +17,8 @@ dependencies = [
     "docker>=7.0.0",
     "kubernetes-asyncio>=33.0.0",
     "asyncpg>=0.29.0",
+    "cryptography>=42.0.0",
+    "prometheus-client>=0.19.0",
 ]
 
 [project.optional-dependencies]
