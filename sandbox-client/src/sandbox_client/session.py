@@ -29,8 +29,13 @@ class SandboxSession:
         return self.info.session_id
 
     @property
+    def session_id(self) -> str:
+        return self.info.session_id
+
+    @property
     def workspace_id(self) -> str:
         return self.info.workspace_id
+
 
     async def exec(
         self,
@@ -62,6 +67,8 @@ class SandboxSession:
             duration_ms=data.get("duration_ms", 0.0),
             error=data.get("error"),
         )
+
+    exec_buffered = exec
 
     async def exec_stream(
         self,

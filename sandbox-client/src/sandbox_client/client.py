@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
 import httpx
 
-from .models import CodeResult, SandboxError, SessionInfo
+from .models import CodeResult, SandboxError, SessionInfo, WorkspaceConflictError
 from .session import SandboxSession
 
 
@@ -88,11 +88,14 @@ class SandboxClient:
                 "ttl_seconds": ttl_seconds,
             },
         )
+        if resp.status_code == 409:
+            raise WorkspaceConflictError(f"Workspace concurrency conflict (409): {resp.text}")
         if resp.status_code != 200:
             raise SandboxError(f"Failed to acquire session: {resp.text}")
 
         info = SessionInfo.model_validate(resp.json())
         return SandboxSession(self.base_url, info, self._http)
+
 
     async def aclose(self):
         """Close the underlying HTTP client."""
