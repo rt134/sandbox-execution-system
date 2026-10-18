@@ -3,6 +3,7 @@ package handlers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -47,7 +48,7 @@ func TestSanitizePath(t *testing.T) {
 					t.Fatalf("unexpected error for input '%s': %v", tc.input, err)
 				}
 				rel, relErr := filepath.Rel(root, cleanPath)
-				if relErr != nil || rel == ".." || len(rel) >= 2 && rel[:2] == ".." {
+				if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 					t.Fatalf("cleanPath '%s' escaped root '%s'", cleanPath, root)
 				}
 			}
@@ -69,7 +70,7 @@ func FuzzSanitizePath(f *testing.F) {
 		res, err := sanitizePath(input)
 		if err == nil {
 			rel, relErr := filepath.Rel(root, res)
-			if relErr != nil || rel == ".." || len(rel) >= 2 && rel[:2] == ".." {
+			if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				t.Errorf("fuzz input %q escaped root: got %q", input, res)
 			}
 		}
