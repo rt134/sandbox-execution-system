@@ -68,8 +68,8 @@ class Sweeper:
         now = time.time()
         grace_period = settings.orphan_grace_period_sec
 
-        # 1. Clean up expired leases
-        expired_leases = await self.lease_manager.get_expired()
+        # 1. Clean up expired leases (atomic claim to avoid killing containers that just renewed)
+        expired_leases = await self.lease_manager.claim_expired(cutoff_time=now)
         for lease in expired_leases:
             logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
             try:
@@ -106,16 +106,19 @@ class Sweeper:
                     except Exception as e:
                         logger.error(f"Failed to destroy orphan container {sbx.sandbox_id}: {e}")
 
-            # 4. Orphan warm pool container garbage collection (reclaimed if engine crashed)
+            # 4. Orphan warm pool container garbage collection (reclaimed if this engine replica crashed)
             if self.warm_pool is not None:
                 tracked_pool_ids = self.warm_pool.get_active_ids()
-                running_warm = await self.driver.list_sandboxes(labels={"sandbox.pool": "warm"})
+                # Multi-replica safe: only inspect warm containers created by this replica's engine_id!
+                running_warm = await self.driver.list_sandboxes(
+                    labels={"sandbox.pool": "warm", "sandbox.engine_id": self.warm_pool.engine_id}
+                )
                 for sbx in running_warm:
                     if sbx.sandbox_id not in tracked_pool_ids:
                         age = now - sbx.created_at
                         if age < grace_period:
                             continue
-                        logger.warning(f"🧹 [Sweeper] Found orphan warm container '{sbx.sandbox_id}' (age: {age:.1f}s). Destroying...")
+                        logger.warning(f"🧹 [Sweeper] Found orphan warm container '{sbx.sandbox_id}' for engine '{self.warm_pool.engine_id}' (age: {age:.1f}s). Destroying...")
                         try:
                             await self.driver.destroy_sandbox(sbx.sandbox_id)
                             SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_warm_container").inc()

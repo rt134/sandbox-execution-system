@@ -106,7 +106,7 @@ class WarmPoolManager:
                 spec_id=f"warm-{uuid.uuid4().hex[:8]}",
                 sandbox_type="stateless",
                 image=settings.image,
-                labels={"sandbox.pool": "warm"},
+                labels={"sandbox.pool": "warm", "sandbox.engine_id": self.engine_id},
                 pids_limit=settings.pids_limit,
                 disk_quota_mb=settings.default_workspace_disk_quota_mb,
                 mem_limit=settings.default_mem_limit,

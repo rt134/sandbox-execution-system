@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..config import settings
 from ..models import LeaseRecord
+from .security import decrypt_token, encrypt_token
 
 logger = logging.getLogger("sandbox.lease_manager")
 
@@ -17,10 +18,16 @@ logger = logging.getLogger("sandbox.lease_manager")
 class LeaseBackend(ABC):
     @abstractmethod
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
+        self,
+        session_id: str,
+        workspace_id: str,
+        sandbox_id: str,
+        endpoint: str,
+        ttl_seconds: int,
+        auth_token: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> LeaseRecord:
         pass
-
 
     @abstractmethod
     async def heartbeat(self, session_id: str, ttl_seconds: int) -> Optional[LeaseRecord]:
@@ -39,11 +46,19 @@ class LeaseBackend(ABC):
         pass
 
     @abstractmethod
+    async def claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
+        pass
+
+    @abstractmethod
     async def mark_expired(self, session_id: str) -> None:
         pass
 
     @abstractmethod
     async def list_active_leases(self) -> List[LeaseRecord]:
+        pass
+
+    @abstractmethod
+    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
         pass
 
     # Concurrency Lock APIs
