@@ -120,6 +120,28 @@ func FSWriteHandler(w http.ResponseWriter, r *http.Request) {
 		data = []byte(req.Content)
 	}
 
+	// Check disk quota before writing
+	quota := getWorkspaceDiskQuota()
+	currentUsage := getWorkspaceDiskUsage()
+
+	var existingSize int64
+	if fi, err := os.Stat(targetPath); err == nil && !fi.IsDir() {
+		existingSize = fi.Size()
+	}
+
+	delta := int64(len(data)) - existingSize
+	if delta > 0 && (currentUsage+delta) > quota {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":           "Workspace disk quota exceeded",
+			"used_bytes":      currentUsage,
+			"quota_bytes":     quota,
+			"requested_bytes": len(data),
+		})
+		return
+	}
+
 	// Create parent directory if missing
 	dir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -281,3 +303,39 @@ func FSDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		"path":   targetPath,
 	})
 }
+
+type FSQuotaResponse struct {
+	UsedBytes  int64   `json:"used_bytes"`
+	QuotaBytes int64   `json:"quota_bytes"`
+	UsedMB     float64 `json:"used_mb"`
+	QuotaMB    float64 `json:"quota_mb"`
+	UsagePct   float64 `json:"usage_pct"`
+}
+
+func FSQuotaHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	used := getWorkspaceDiskUsage()
+	quota := getWorkspaceDiskQuota()
+
+	usedMB := float64(used) / (1024.0 * 1024.0)
+	quotaMB := float64(quota) / (1024.0 * 1024.0)
+	var usagePct float64
+	if quota > 0 {
+		usagePct = (float64(used) / float64(quota)) * 100.0
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(FSQuotaResponse{
+		UsedBytes:  used,
+		QuotaBytes: quota,
+		UsedMB:     usedMB,
+		QuotaMB:    quotaMB,
+		UsagePct:   usagePct,
+	})
+}
+

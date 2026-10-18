@@ -133,7 +133,7 @@ print(result.output)      # {'doubled': 42}
 print(result.duration_ms) # ~16ms!
 ```
 
-#### Example 2: Stateful OS Sandbox for Autonomous Coding Agents
+#### Example 2: Stateful OS Sandbox for Autonomous Agents
 ```python
 from sandbox_client import SandboxClient
 
@@ -172,18 +172,18 @@ async with SandboxClient(base_url="http://localhost:8080") as client:
 
 ## Running the Verification Test Suites
 
-Every phase is independently testable:
+Every part is independently testable:
 
 ```bash
-# Phase 1: In-Sandbox Daemon & Base Image
+# In-Sandbox Daemon & Base Image
 python3 daemon/test_daemon.py
 
-# Phase 2: Warm Pool Stateless Benchmark (<50ms SLA)
+# Warm Pool Stateless Benchmark (<50ms SLA)
 cd sandbox-engine && PYTHONPATH=src python3 tests/test_stateless_bench.py
 
-# Phase 3: Stateful Workspace Persistence & Sweeper GC
+# Stateful Workspace Persistence & Sweeper GC
 cd sandbox-engine && PYTHONPATH=src python3 tests/test_stateful_suite.py
 
-# Phase 4: Full End-to-End Integration Suite
+# Full End-to-End Integration Suite
 PYTHONPATH="sandbox-engine/src:sandbox-client/src" python3 sandbox-client/tests/test_e2e.py
 ```

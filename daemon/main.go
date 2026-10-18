@@ -59,6 +59,7 @@ func main() {
 	mux.HandleFunc("/fs/read", handlers.FSReadHandler)
 	mux.HandleFunc("/fs/list", handlers.FSListHandler)
 	mux.HandleFunc("/fs/delete", handlers.FSDeleteHandler)
+	mux.HandleFunc("/fs/quota", handlers.FSQuotaHandler)
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	server := &http.Server{
