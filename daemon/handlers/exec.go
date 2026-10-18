@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -35,6 +36,8 @@ type ExecFullResponse struct {
 	DurationMs float64 `json:"duration_ms"`
 	Error      *string `json:"error,omitempty"`
 }
+
+const maxOutputBytes = 10 * 1024 * 1024 // 10 MB limit to prevent daemon memory exhaustion
 
 func ExecHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -115,8 +118,7 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 	enc := json.NewEncoder(w)
 
 	streamOutput := func(r io.Reader, streamType string) {
-		scanner := bufio.NewScanner(r)
-		// 1MB buffer for long lines
+		scanner := bufio.NewScanner(io.LimitReader(r, maxOutputBytes))
 		buf := make([]byte, 64*1024)
 		scanner.Buffer(buf, 1024*1024)
 
@@ -131,9 +133,20 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 		}
 	}
 
-	go streamOutput(stdoutPipe, "stdout")
-	go streamOutput(stderrPipe, "stderr")
+	var wg sync.WaitGroup
+	wg.Add(2)
 
+	go func() {
+		defer wg.Done()
+		streamOutput(stdoutPipe, "stdout")
+	}()
+	go func() {
+		defer wg.Done()
+		streamOutput(stderrPipe, "stderr")
+	}()
+
+	// Wait for pipe readers to complete BEFORE calling cmd.Wait() to prevent races
+	wg.Wait()
 	execErr := cmd.Wait()
 
 	exitCode := 0
@@ -181,13 +194,20 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 		return
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
-		stdoutBuf, _ = io.ReadAll(stdoutPipe)
+		defer wg.Done()
+		stdoutBuf, _ = io.ReadAll(io.LimitReader(stdoutPipe, maxOutputBytes))
 	}()
 	go func() {
-		stderrBuf, _ = io.ReadAll(stderrPipe)
+		defer wg.Done()
+		stderrBuf, _ = io.ReadAll(io.LimitReader(stderrPipe, maxOutputBytes))
 	}()
 
+	// Wait for readers to finish reading pipes before cmd.Wait()
+	wg.Wait()
 	execErr := cmd.Wait()
 	durationMs := float64(time.Since(start).Microseconds()) / 1000.0
 

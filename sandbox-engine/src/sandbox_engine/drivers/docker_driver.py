@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Dict, List, Optional
 import docker
 import httpx
@@ -13,12 +14,11 @@ from .base import ContainerDriver
 
 class DockerDriver(ContainerDriver):
     """
-    Docker driver for local macOS/Linux development and single-node instances.
-    Communicates with Docker daemon via Unix socket.
+    Production-hardened Docker driver for local macOS/Linux and single-node instances.
+    Enforces cgroup limits, privilege dropping, proxy routing, and runtime checks.
     """
 
     def __init__(self):
-        # Auto-detect standard or Docker Desktop unix socket
         socket_paths = [
             os.path.expanduser("~/.docker/run/docker.sock"),
             "/var/run/docker.sock",
@@ -35,10 +35,12 @@ class DockerDriver(ContainerDriver):
         return await asyncio.to_thread(self._sync_create_sandbox, spec)
 
     def _sync_create_sandbox(self, spec: SandboxSpec) -> SandboxInstance:
+        now = time.time()
         labels = {
             "sandbox.managed": "true",
             "sandbox.type": spec.sandbox_type,
             "sandbox.id": spec.spec_id,
+            "sandbox.created_at": str(int(now)),
             **spec.labels,
         }
 
@@ -47,13 +49,26 @@ class DockerDriver(ContainerDriver):
             os.makedirs(spec.workspace_path, exist_ok=True)
             volumes[spec.workspace_path] = {"bind": "/workspace", "mode": "rw"}
 
-        # Dynamic free port allocation: bind to 127.0.0.1 with random port
+        # Dynamic free port allocation: bind strictly to 127.0.0.1
         ports = {"5004/tcp": ("127.0.0.1", None)}
 
         env = {
             "WORKSPACE_DISK_QUOTA_MB": str(spec.disk_quota_mb),
             **spec.env,
         }
+        if spec.auth_token:
+            env["SHELLCTL_AUTH_TOKEN"] = spec.auth_token
+
+        # Egress Proxy Configuration
+        if settings.http_proxy:
+            env["http_proxy"] = settings.http_proxy
+            env["HTTP_PROXY"] = settings.http_proxy
+        if settings.https_proxy:
+            env["https_proxy"] = settings.https_proxy
+            env["HTTPS_PROXY"] = settings.https_proxy
+        if settings.no_proxy:
+            env["no_proxy"] = settings.no_proxy
+            env["NO_PROXY"] = settings.no_proxy
 
         runtime = settings.docker_runtime
         kwargs = {
@@ -65,18 +80,26 @@ class DockerDriver(ContainerDriver):
             "ports": ports,
             "network": settings.docker_network,
             "pids_limit": spec.pids_limit,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
         }
+        if spec.cpu_limit:
+            kwargs["nano_cpus"] = int(spec.cpu_limit * 1e9)
         if spec.mem_limit:
             kwargs["mem_limit"] = spec.mem_limit
             kwargs["memswap_limit"] = spec.mem_limit
 
-        # If gVisor runsc is specified and supported, use it; otherwise fallback to default runc
+        # Handle runtime selection: fail hard if requested runtime unavailable
         if runtime and runtime != "runc":
             try:
                 kwargs["runtime"] = runtime
                 container = self.client.containers.run(**kwargs)
-            except Exception:
-                # Fallback to standard runtime if runsc not available
+            except Exception as e:
+                if not settings.allow_runtime_fallback:
+                    raise RuntimeError(
+                        f"Requested container runtime '{runtime}' failed to launch: {e}. "
+                        "Refusing to fall back silently to insecure runtime."
+                    )
                 kwargs.pop("runtime", None)
                 container = self.client.containers.run(**kwargs)
         else:
@@ -94,8 +117,14 @@ class DockerDriver(ContainerDriver):
             sandbox_id=container.id[:12],
             driver="docker",
             endpoint=endpoint,
+            created_at=now,
             status="running",
-            metadata={"container_name": container.name, "host_port": host_port},
+            metadata={
+                "container_name": container.name,
+                "host_port": host_port,
+                "created_at": now,
+            },
+            auth_token=spec.auth_token,
         )
 
     async def destroy_sandbox(self, sandbox_id: str) -> None:
@@ -116,7 +145,6 @@ class DockerDriver(ContainerDriver):
         port_bindings = container.ports.get("5004/tcp")
         if port_bindings:
             return f"http://127.0.0.1:{port_bindings[0]['HostPort']}"
-        # Fallback to container network IP if running inside Docker network
         ip = container.attrs["NetworkSettings"]["IPAddress"]
         return f"http://{ip}:5004"
 
@@ -134,20 +162,31 @@ class DockerDriver(ContainerDriver):
         for c in containers:
             port_bindings = c.ports.get("5004/tcp")
             endpoint = f"http://127.0.0.1:{port_bindings[0]['HostPort']}" if port_bindings else ""
+            c_labels = c.labels or {}
+            try:
+                created_ts = float(c_labels.get("sandbox.created_at", 0.0))
+            except ValueError:
+                created_ts = 0.0
+
             instances.append(
                 SandboxInstance(
                     sandbox_id=c.id[:12],
                     driver="docker",
                     endpoint=endpoint,
+                    created_at=created_ts or time.time(),
                     status=c.status,
-                    metadata={"container_name": c.name},
+                    metadata={"container_name": c.name, "created_at": created_ts},
                 )
             )
         return instances
 
-    async def healthcheck(self, endpoint: str) -> bool:
+    async def healthcheck(self, endpoint: str, auth_token: Optional[str] = None) -> bool:
         """Poll the sandbox endpoint until /health responds 200 OK."""
-        async with httpx.AsyncClient(timeout=0.5) as client:
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
+        async with httpx.AsyncClient(timeout=0.5, headers=headers) as client:
             for _ in range(20):  # Retry up to 2 seconds
                 try:
                     resp = await client.get(f"{endpoint}/health")

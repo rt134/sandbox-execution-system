@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-isolation-policy
+  namespace: sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      sandbox.managed: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow incoming traffic ONLY from the engine/gateway pods
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sandbox-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbox-engine
+      ports:
+        - protocol: TCP
+          port: 5004
+  egress:
+    # 1. Allow CoreDNS for domain resolution
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. Allow Egress ONLY to the Squid / Corporate Outbound Proxy
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sandbox-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: squid-proxy
+      ports:
+        - protocol: TCP
+          port: 3128

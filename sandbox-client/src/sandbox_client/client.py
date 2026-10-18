@@ -14,9 +14,19 @@ class SandboxClient:
     Connects to sandbox-engine to run stateless code and manage stateful agent sessions.
     """
 
-    def __init__(self, base_url: str = "http://localhost:8080", timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        api_key: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
         self.base_url = base_url.rstrip("/")
-        self._http = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        self.api_key = api_key
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._http = httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=timeout)
+
 
     async def run_code(
         self,

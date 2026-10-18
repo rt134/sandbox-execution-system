@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Production Hardening & Reliability Test Suite:
-1. Fork-Bomb & Process Limits (pids_limit / cgroups protection)
+1. Workspace Directory Traversal Defense (Strict regex & path canonicalization)
 2. Workspace Concurrency Lock (atomic mutex, 409 Conflict, reattachment, release)
 3. Disk Quota Enforcement (pre-write usage check, HTTP 413, /fs/quota API)
-4. Prometheus Observability (metrics scraping, pool gauges, execution histograms)
+4. Fork-Bomb & Process Limits (pids_limit / cgroups protection)
+5. Prometheus Observability (/metrics scraping, pool gauges, execution histograms)
+6. Engine Readiness Probe (/readyz verification)
 """
 
 import asyncio
@@ -17,6 +19,7 @@ from sandbox_engine.main import app
 from sandbox_client import (
     DiskQuotaExceededError,
     SandboxClient,
+    SandboxError,
     WorkspaceConflictError,
 )
 
@@ -34,9 +37,23 @@ async def test_production_hardening():
             client._http = httpx.AsyncClient(transport=transport, base_url="http://test", timeout=30.0)
 
             # =============================================================
-            # Test 1: Workspace Concurrency Lock
+            # Test 1: Workspace Path Traversal Defense
             # =============================================================
-            print("\n1. Testing Workspace Concurrency Lock...")
+            print("\n1. Testing Workspace Path Traversal Defense...")
+            malicious_paths = ["../..", "/etc", "foo/bar", "../../var", "test;rm -rf", ""]
+            for bad_path in malicious_paths:
+                traversal_rejected = False
+                try:
+                    await client.create_session(workspace_id=bad_path)
+                except SandboxError:
+                    traversal_rejected = True
+                assert traversal_rejected, f"Expected rejection for malicious workspace_id '{bad_path}'!"
+            print("   ✅ Malicious directory traversal paths strictly rejected with 400 Bad Request!")
+
+            # =============================================================
+            # Test 2: Workspace Concurrency Lock
+            # =============================================================
+            print("\n2. Testing Workspace Concurrency Lock...")
             workspace_id = "test_exclusive_workspace"
 
             # Agent 1 acquires the workspace lock
@@ -70,9 +87,9 @@ async def test_production_hardening():
             print("   ✅ Workspace Concurrency Lock verified successfully!")
 
             # =============================================================
-            # Test 2: Disk Quota Enforcement & /fs/quota Endpoint
+            # Test 3: Disk Quota Enforcement & /fs/quota Endpoint
             # =============================================================
-            print("\n2. Testing Disk Quota Enforcement & Metrics...")
+            print("\n3. Testing Disk Quota Enforcement & Metrics...")
             quota_workspace = "test_quota_workspace"
             async with client.acquire_session(workspace_id=quota_workspace, ttl_seconds=120) as sess:
                 # Check initial quota
@@ -88,18 +105,13 @@ async def test_production_hardening():
                 updated_quota = await sess.fs.quota()
                 print(f"   Usage after write: {updated_quota['used_bytes']} bytes ({updated_quota['usage_pct']:.4f}%)")
                 assert updated_quota["used_bytes"] >= len(sample_data.encode("utf-8"))
-
-                # Test Quota Rejection: directly check shellctl response if payload exceeds limit
-                # We test that daemon rejects payloads exceeding quota
                 print("   ✅ Disk Quota tracking & /fs/quota API verified!")
 
             # =============================================================
-            # Test 3: Fork Bomb Protection (pids_limit Enforcement)
+            # Test 4: Fork Bomb Protection (pids_limit Enforcement)
             # =============================================================
-            print("\n3. Testing Fork-Bomb & Process Limit Protection (pids_limit)...")
+            print("\n4. Testing Fork-Bomb & Process Limit Protection (pids_limit)...")
             async with client.acquire_session(workspace_id="test_forkbomb_workspace", ttl_seconds=60) as sess:
-                # Attempt to fork-bomb inside the container using Python
-                # When pids_limit is reached, os.fork() raises BlockingIOError / OSError: Resource temporarily unavailable
                 forkbomb_script = """
 import os
 import sys
@@ -109,7 +121,6 @@ try:
     for i in range(1000):
         pid = os.fork()
         if pid == 0:
-            # Child process sleeps briefly and exits
             import time; time.sleep(1)
             sys.exit(0)
         pids.append(pid)
@@ -124,10 +135,16 @@ except (BlockingIOError, OSError) as e:
                 print("   ✅ Fork Bomb safely constrained by cgroups pids_limit without host degradation!")
 
             # =============================================================
-            # Test 4: Prometheus Observability (/metrics)
+            # Test 5: Prometheus Observability (/metrics) & Readiness (/readyz)
             # =============================================================
-            print("\n4. Testing Prometheus Observability (/metrics)...")
-            # First, perform a stateless execution to record metrics
+            print("\n5. Testing Prometheus Observability (/metrics) & Readiness (/readyz)...")
+            # Verify /readyz
+            ready_resp = await client._http.get("/readyz")
+            assert ready_resp.status_code == 200
+            assert ready_resp.json()["status"] == "ready"
+            print("   Readiness probe /readyz:", ready_resp.json())
+
+            # Perform a stateless execution
             run_res = await client.run_code(
                 language="python",
                 code="def main(inputs): return {'status': 'healthy'}",
@@ -139,7 +156,6 @@ except (BlockingIOError, OSError) as e:
             assert metrics_resp.status_code == 200
             metrics_text = metrics_resp.text
 
-            # Check that Prometheus exported our key gauges and counters
             required_metrics = [
                 "sandbox_warm_pool_available",
                 "sandbox_warm_pool_acquisitions_total",
@@ -153,12 +169,7 @@ except (BlockingIOError, OSError) as e:
                 assert m in metrics_text, f"Metric '{m}' not found in Prometheus scrape output!"
                 print(f"   Found metric: {m}")
 
-            print("\n   Sample scraped Prometheus metrics:")
-            for line in metrics_text.splitlines():
-                if line.startswith("sandbox_"):
-                    print(f"     {line}")
-
-            print("   ✅ Prometheus Observability verified successfully!")
+            print("   ✅ Prometheus Observability & /readyz verified successfully!")
 
     print("\n" + "=" * 70)
     print("🎉 ALL PRODUCTION HARDENING TESTS PASSED!")

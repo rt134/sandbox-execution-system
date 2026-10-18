@@ -5,6 +5,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..core.metrics import STATELESS_DURATION_SECONDS, STATELESS_RUNS_TOTAL
+from ..core.security import verify_api_key
 from ..core.warm_pool import WarmPoolManager
 from ..models import StatelessRunRequest, StatelessRunResponse
 
@@ -15,7 +16,7 @@ def get_warm_pool(request: Request) -> WarmPoolManager:
     return request.app.state.warm_pool
 
 
-@router.post("/run", response_model=StatelessRunResponse)
+@router.post("/run", response_model=StatelessRunResponse, dependencies=[Depends(verify_api_key)])
 async def run_stateless_code(
     payload: StatelessRunRequest,
     warm_pool: WarmPoolManager = Depends(get_warm_pool),
@@ -34,9 +35,13 @@ async def run_stateless_code(
         raise HTTPException(status_code=503, detail=f"No available warm sandbox: {e}")
 
     try:
-        # 2. Direct HTTP dispatch to shellctl inside container
+        # 2. Direct HTTP dispatch to shellctl inside container with internal auth
         timeout_client = httpx.Timeout(payload.timeout + 2.0, connect=1.0)
-        async with httpx.AsyncClient(timeout=timeout_client) as client:
+        headers = {}
+        if instance.auth_token:
+            headers["Authorization"] = f"Bearer {instance.auth_token}"
+
+        async with httpx.AsyncClient(timeout=timeout_client, headers=headers) as client:
             resp = await client.post(
                 f"{instance.endpoint}/execute",
                 json={
@@ -46,6 +51,7 @@ async def run_stateless_code(
                     "timeout": payload.timeout,
                 },
             )
+
 
         if resp.status_code != 200:
             status = "failed"

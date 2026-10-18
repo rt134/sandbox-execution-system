@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,19 +18,33 @@ class EngineSettings(BaseSettings):
     # Container Images
     image: str = "sandbox-base:latest"
 
+    # Authentication & Security
+    api_key: Optional[str] = None  # Caller -> Engine Bearer token / X-API-Key
+    daemon_auth_token: Optional[str] = None  # Engine -> Daemon internal shared secret
+    cors_allowed_origins: List[str] = ["*"]
+
     # Pool Configurations (Stateless)
     warm_pool_size: int = 2
     warm_pool_acquire_timeout: float = 5.0
+    max_concurrent_spawns: int = 10  # Cap concurrent container launches
 
     # Stateful Session Configurations
     default_session_ttl: int = 300
     sweeper_interval_sec: float = 5.0
+    orphan_grace_period_sec: float = 60.0  # Prevent sweeper race on freshly created containers
     workspaces_root: str = os.path.abspath(".workspaces")
     redis_url: Optional[str] = "redis://localhost:6379/0"
     sqlite_path: str = ".sandbox_ledger.db"
+    require_redis: bool = False  # If True, refuse silent fallback to SQLite in multi-replica setup
+
+    # Egress Proxy Configurations (Squid)
+    http_proxy: Optional[str] = None
+    https_proxy: Optional[str] = None
+    no_proxy: str = "localhost,127.0.0.1"
 
     # Docker Specific Settings
     docker_runtime: str = "runc"  # 'runc' for local dev, 'runsc' for gVisor production
+    allow_runtime_fallback: bool = False  # Fail hard if requested secure runtime is unavailable!
     docker_network: str = "bridge"
     docker_host_port_start: int = 15000
 
@@ -39,6 +53,7 @@ class EngineSettings(BaseSettings):
     k8s_runtime_class: str = "gvisor"
     k8s_node_selector_key: str = "sandbox"
     k8s_node_selector_value: str = "true"
+    k8s_use_pvc: bool = False
 
     # Engine Server Settings
     host: str = "0.0.0.0"

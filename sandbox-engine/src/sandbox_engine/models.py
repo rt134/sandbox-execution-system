@@ -16,6 +16,7 @@ class SandboxSpec(BaseModel):
     mem_limit: str = "512m"
     pids_limit: int = 256
     disk_quota_mb: int = 1024
+    auth_token: Optional[str] = None
 
 
 class SandboxInstance(BaseModel):
@@ -25,6 +26,7 @@ class SandboxInstance(BaseModel):
     created_at: float = Field(default_factory=time.time)
     status: str = "running"
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    auth_token: Optional[str] = None
 
 
 class StatelessRunRequest(BaseModel):
@@ -51,6 +53,8 @@ class LeaseRecord(BaseModel):
     created_at: float
     expires_at: float
     status: Literal["active", "expired", "released"] = "active"
+    auth_token: Optional[str] = None
+
 
 
 class SessionAcquireRequest(BaseModel):

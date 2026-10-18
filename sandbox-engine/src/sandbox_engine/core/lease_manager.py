@@ -17,9 +17,10 @@ logger = logging.getLogger("sandbox.lease_manager")
 class LeaseBackend(ABC):
     @abstractmethod
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int
+        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
     ) -> LeaseRecord:
         pass
+
 
     @abstractmethod
     async def heartbeat(self, session_id: str, ttl_seconds: int) -> Optional[LeaseRecord]:
@@ -94,10 +95,16 @@ class SQLiteLeaseBackend(LeaseBackend):
                     endpoint TEXT,
                     created_at REAL,
                     expires_at REAL,
-                    status TEXT
+                    status TEXT,
+                    auth_token TEXT
                 )
                 """
             )
+            try:
+                conn.execute("ALTER TABLE leases ADD COLUMN auth_token TEXT")
+            except Exception:
+                pass
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workspace_locks (
@@ -110,7 +117,7 @@ class SQLiteLeaseBackend(LeaseBackend):
             conn.commit()
 
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int
+        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
     ) -> LeaseRecord:
         async with self._lock:
             now = time.time()
@@ -123,6 +130,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                 created_at=now,
                 expires_at=expires_at,
                 status="active",
+                auth_token=auth_token,
             )
             await asyncio.to_thread(self._sync_save, record)
             return record
@@ -131,8 +139,8 @@ class SQLiteLeaseBackend(LeaseBackend):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.session_id,
@@ -142,6 +150,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     record.created_at,
                     record.expires_at,
                     record.status,
+                    record.auth_token,
                 ),
             )
             conn.commit()
@@ -161,7 +170,7 @@ class SQLiteLeaseBackend(LeaseBackend):
     def _sync_get(self, session_id: str) -> Optional[LeaseRecord]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status FROM leases WHERE session_id = ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE session_id = ?",
                 (session_id,),
             )
             row = cursor.fetchone()
@@ -174,8 +183,10 @@ class SQLiteLeaseBackend(LeaseBackend):
                     created_at=row[4],
                     expires_at=row[5],
                     status=row[6],
+                    auth_token=row[7] if len(row) > 7 else None,
                 )
         return None
+
 
     async def release_lease(self, session_id: str) -> bool:
         async with self._lock:
@@ -519,6 +530,11 @@ class LeaseManager:
                 self._backend = RedisLeaseBackend(client)
                 return
             except Exception as e:
+                if settings.require_redis:
+                    raise RuntimeError(
+                        f"Failed to connect to Redis at {settings.redis_url} ({e}) and require_redis is True. "
+                        "Refusing to fall back to SQLite to prevent split-brain across multiple engine replicas."
+                    )
                 logger.warning(f"Redis unavailable ({e}); falling back to SQLite ledger at {settings.sqlite_path}")
 
         self._backend = SQLiteLeaseBackend(settings.sqlite_path)

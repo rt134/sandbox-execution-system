@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,10 +20,38 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		// Avoid logging noisy health checks in normal operation
 		if r.URL.Path != "/health" {
 			log.Printf("[%s] %s %s (%v)", r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
 		}
+	})
+}
+
+// authMiddleware enforces constant-time Bearer token verification if SHELLCTL_AUTH_TOKEN is configured
+func authMiddleware(next http.Handler) http.Handler {
+	expectedToken := os.Getenv("SHELLCTL_AUTH_TOKEN")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Health probe is always unauthenticated
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if expectedToken != "" {
+			token := ""
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				token = strings.TrimPrefix(authHeader, "Bearer ")
+			} else if qToken := r.URL.Query().Get("token"); qToken != "" {
+				token = qToken
+			}
+
+			if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
+				http.Error(w, "Unauthorized: invalid or missing daemon authentication token", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -64,7 +94,7 @@ func main() {
 	addr := fmt.Sprintf("%s:%s", host, port)
 	server := &http.Server{
 		Addr:         addr,
-		Handler:      loggingMiddleware(mux),
+		Handler:      loggingMiddleware(authMiddleware(mux)),
 		ReadTimeout:  120 * time.Second,
 		WriteTimeout: 120 * time.Second,
 	}

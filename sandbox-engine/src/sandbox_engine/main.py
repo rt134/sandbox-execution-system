@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from .api.routes_stateless import router as stateless_router
 from .api.routes_sessions import router as sessions_router
+from .api.routes_stateless import router as stateless_router
 from .api.routes_ws import router as ws_router
 from .config import settings
 from .core.lease_manager import LeaseManager
+from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
 from .core.sweeper import Sweeper
 from .core.warm_pool import WarmPoolManager
 from .drivers import get_driver
@@ -26,17 +29,22 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 Initializing sandbox-engine with driver: {settings.driver}")
     driver = get_driver()
 
-    # 1. Initialize Lease Manager (Redis with SQLite fallback)
+    # 1. Initialize Lease Manager (Redis with SQLite fallback unless require_redis is set)
     lease_mgr = LeaseManager()
     await lease_mgr.initialize()
 
-    # 2. Initialize Sweeper GC Loop
-    sweeper = Sweeper(driver=driver, lease_manager=lease_mgr, interval_sec=settings.sweeper_interval_sec)
-    sweeper.start()
-
-    # 3. Initialize Stateless Warm Pool
+    # 2. Initialize Stateless Warm Pool
     warm_pool = WarmPoolManager(driver=driver, target_size=settings.warm_pool_size)
     await warm_pool.start()
+
+    # 3. Initialize Sweeper GC Loop (passing warm_pool for orphan cleanup)
+    sweeper = Sweeper(
+        driver=driver,
+        lease_manager=lease_mgr,
+        warm_pool=warm_pool,
+        interval_sec=settings.sweeper_interval_sec,
+    )
+    sweeper.start()
 
     app.state.driver = driver
     app.state.lease_manager = lease_mgr
@@ -58,10 +66,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Secure CORS Middleware: Never pair wildcard origins with credentials
+is_wildcard = "*" in settings.cors_allowed_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=settings.cors_allowed_origins,
+    allow_credentials=not is_wildcard,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -71,8 +81,9 @@ app.include_router(sessions_router)
 app.include_router(ws_router)
 
 
-@app.get("/healthz")
+@app.get("/healthz", tags=["System"])
 async def healthz():
+    """Liveness probe: returns 200 if server process is running."""
     driver_name = getattr(app.state, "driver", None).__class__.__name__ if hasattr(app.state, "driver") else "unknown"
     pool_size = app.state.warm_pool.queue.qsize() if hasattr(app.state, "warm_pool") else 0
     active_leases = len(await app.state.lease_manager.list_active()) if hasattr(app.state, "lease_manager") else 0
@@ -85,9 +96,19 @@ async def healthz():
     }
 
 
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from fastapi.responses import Response
-from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
+@app.get("/readyz", tags=["System"])
+async def readyz():
+    """Readiness probe: validates backend container driver and warm pool availability."""
+    if not hasattr(app.state, "driver") or not hasattr(app.state, "warm_pool"):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Engine initializing")
+
+    # Verify warm pool has ready instances or driver is responsive
+    pool_size = app.state.warm_pool.queue.qsize()
+    return {
+        "status": "ready",
+        "warm_pool_ready": pool_size > 0,
+        "warm_pool_size": pool_size,
+    }
 
 
 @app.get("/metrics", tags=["Observability"])

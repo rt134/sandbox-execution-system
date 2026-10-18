@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from typing import Dict, List, Optional
 import httpx
 from kubernetes_asyncio import client, config
@@ -11,10 +13,23 @@ from ..models import SandboxInstance, SandboxSpec
 from .base import ContainerDriver
 
 
+def normalize_k8s_mem(mem: str) -> str:
+    """Normalize memory unit for Kubernetes (e.g. '512m' -> '512Mi', '1g' -> '1Gi')."""
+    if not mem:
+        return "512Mi"
+    mem = mem.strip()
+    if mem.endswith("m") and not mem.endswith("Mi"):
+        return f"{mem[:-1]}Mi"
+    elif mem.endswith("g") and not mem.endswith("Gi"):
+        return f"{mem[:-1]}Gi"
+    return mem
+
+
 class KubernetesDriver(ContainerDriver):
     """
-    Kubernetes driver for cloud-native production clusters.
-    Manages Pods on dedicated tainted nodes with gVisor RuntimeClass.
+    Production-hardened Kubernetes driver for cloud-native clusters.
+    Manages Pods on dedicated tainted nodes with gVisor RuntimeClass,
+    RFC 1123 DNS-compliant naming, proper memory units, volume mounts, and dropped capabilities.
     """
 
     def __init__(self):
@@ -24,14 +39,11 @@ class KubernetesDriver(ContainerDriver):
     async def _init_client(self):
         if not self._initialized:
             try:
-                # Try in-cluster config first (production pod)
                 config.load_incluster_config()
             except Exception:
                 try:
-                    # Fallback to local kubeconfig (~/.kube/config)
                     await config.load_kube_config()
-                except Exception as e:
-                    # Allow initialization even without live cluster (for unit testing/offline)
+                except Exception:
                     pass
             self._core_api = client.CoreV1Api()
             self._initialized = True
@@ -39,16 +51,20 @@ class KubernetesDriver(ContainerDriver):
     async def create_sandbox(self, spec: SandboxSpec) -> SandboxInstance:
         await self._init_client()
         namespace = settings.k8s_namespace
-        pod_name = f"sandbox-{spec.spec_id[:16]}"
+        now = time.time()
+
+        # Sanitize Pod name to be RFC 1123 compliant (lowercase alphanumeric & hyphens only)
+        clean_id = re.sub(r"[^a-z0-9\-]", "-", spec.spec_id.lower()).strip("-")[:40]
+        pod_name = f"sandbox-{clean_id}"
 
         labels = {
             "sandbox.managed": "true",
             "sandbox.type": spec.sandbox_type,
-            "sandbox.id": spec.spec_id,
+            "sandbox.id": clean_id,
+            "sandbox.created_at": str(int(now)),
             **spec.labels,
         }
 
-        # Tolerations for tainted node pool (sandbox=true:NoSchedule)
         tolerations = [
             client.V1Toleration(
                 key=settings.k8s_node_selector_key,
@@ -62,21 +78,63 @@ class KubernetesDriver(ContainerDriver):
         container_env = [
             client.V1EnvVar(name="WORKSPACE_DISK_QUOTA_MB", value=str(spec.disk_quota_mb))
         ]
+        if spec.auth_token:
+            container_env.append(client.V1EnvVar(name="SHELLCTL_AUTH_TOKEN", value=spec.auth_token))
+        if settings.http_proxy:
+            container_env.append(client.V1EnvVar(name="http_proxy", value=settings.http_proxy))
+            container_env.append(client.V1EnvVar(name="HTTP_PROXY", value=settings.http_proxy))
+        if settings.https_proxy:
+            container_env.append(client.V1EnvVar(name="https_proxy", value=settings.https_proxy))
+            container_env.append(client.V1EnvVar(name="HTTPS_PROXY", value=settings.https_proxy))
+        if settings.no_proxy:
+            container_env.append(client.V1EnvVar(name="no_proxy", value=settings.no_proxy))
+            container_env.append(client.V1EnvVar(name="NO_PROXY", value=settings.no_proxy))
+
         container_env.extend([client.V1EnvVar(name=k, value=v) for k, v in spec.env.items()])
 
-        # Container spec
+        # Normalize memory format (e.g. '512m' -> '512Mi')
+        normalized_mem = normalize_k8s_mem(spec.mem_limit)
+
+        # Volume mounts for stateful sandboxes
+        pod_volumes = []
+        volume_mounts = []
+        if spec.workspace_path:
+            vol_name = "workspace-volume"
+            if settings.k8s_use_pvc:
+                volume = client.V1Volume(
+                    name=vol_name,
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=f"pvc-{clean_id}"
+                    ),
+                )
+            else:
+                volume = client.V1Volume(
+                    name=vol_name,
+                    empty_dir=client.V1EmptyDirVolumeSource(),
+                )
+            pod_volumes.append(volume)
+            volume_mounts.append(client.V1VolumeMount(name=vol_name, mount_path="/workspace"))
+
+        # Security context: drop all capabilities, no privilege escalation
+        sec_context = client.V1SecurityContext(
+            allow_privilege_escalation=False,
+            capabilities=client.V1Capabilities(drop=["ALL"]),
+        )
+
         container = client.V1Container(
             name="sandbox-kernel",
             image=spec.image,
             ports=[client.V1ContainerPort(container_port=5004)],
             env=container_env,
+            volume_mounts=volume_mounts if volume_mounts else None,
+            security_context=sec_context,
             resources=client.V1ResourceRequirements(
                 limits={
                     "cpu": str(spec.cpu_limit),
-                    "memory": spec.mem_limit,
+                    "memory": normalized_mem,
                     "ephemeral-storage": f"{spec.disk_quota_mb}Mi",
                 },
-                requests={"cpu": "100m", "memory": "128m"},
+                requests={"cpu": "100m", "memory": "128Mi"},
             ),
         )
 
@@ -86,6 +144,7 @@ class KubernetesDriver(ContainerDriver):
             node_selector=node_selector,
             automount_service_account_token=False,  # Security hardening
             containers=[container],
+            volumes=pod_volumes if pod_volumes else None,
             restart_policy="Never",
         )
 
@@ -117,8 +176,10 @@ class KubernetesDriver(ContainerDriver):
             sandbox_id=pod_name,
             driver="k8s",
             endpoint=endpoint,
+            created_at=now,
             status="running",
-            metadata={"namespace": namespace, "pod_name": pod_name, "pod_ip": pod_ip},
+            metadata={"namespace": namespace, "pod_name": pod_name, "pod_ip": pod_ip, "created_at": now},
+            auth_token=spec.auth_token,
         )
 
     async def destroy_sandbox(self, sandbox_id: str) -> None:
@@ -155,19 +216,30 @@ class KubernetesDriver(ContainerDriver):
         instances = []
         for pod in pods.items:
             endpoint = f"http://{pod.status.pod_ip}:5004" if pod.status.pod_ip else ""
+            p_labels = pod.metadata.labels or {}
+            try:
+                created_ts = float(p_labels.get("sandbox.created_at", 0.0))
+            except ValueError:
+                created_ts = 0.0
+
             instances.append(
                 SandboxInstance(
                     sandbox_id=pod.metadata.name,
                     driver="k8s",
                     endpoint=endpoint,
+                    created_at=created_ts or time.time(),
                     status=pod.status.phase or "unknown",
-                    metadata={"namespace": namespace, "pod_name": pod.metadata.name},
+                    metadata={"namespace": namespace, "pod_name": pod.metadata.name, "created_at": created_ts},
                 )
             )
         return instances
 
-    async def healthcheck(self, endpoint: str) -> bool:
-        async with httpx.AsyncClient(timeout=0.5) as client:
+    async def healthcheck(self, endpoint: str, auth_token: Optional[str] = None) -> bool:
+        headers = {}
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
+        async with httpx.AsyncClient(timeout=0.5, headers=headers) as client:
             for _ in range(20):
                 try:
                     resp = await client.get(f"{endpoint}/health")

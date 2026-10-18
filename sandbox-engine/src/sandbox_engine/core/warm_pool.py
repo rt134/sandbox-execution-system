@@ -7,6 +7,7 @@ from typing import Optional, Set
 import httpx
 
 from ..config import settings
+from ..core.security import generate_daemon_token
 from ..drivers.base import ContainerDriver
 from ..models import SandboxInstance, SandboxSpec
 from .metrics import WARM_POOL_ACQUISITIONS_TOTAL, WARM_POOL_AVAILABLE
@@ -17,7 +18,7 @@ logger = logging.getLogger("sandbox.warm_pool")
 class WarmPoolManager:
     """
     Manages a pool of pre-warmed, idle sandboxes for sub-50ms execution.
-    Implements a 'replenish-on-consume' pattern.
+    Implements a 'replenish-on-consume' pattern with bounded concurrency semaphore.
     """
 
     def __init__(self, driver: ContainerDriver, target_size: Optional[int] = None):
@@ -27,6 +28,12 @@ class WarmPoolManager:
         self._active_spawns: int = 0
         self._running: bool = False
         self._all_pool_ids: Set[str] = set()
+        # Cap concurrent Docker/K8s launches to avoid socket / API server starvation
+        self._semaphore = asyncio.Semaphore(settings.max_concurrent_spawns)
+
+    def get_active_ids(self) -> Set[str]:
+        """Returns set of all active sandbox IDs tracked by this warm pool."""
+        return set(self._all_pool_ids)
 
     async def start(self):
         """Initialize the warm pool up to target size."""
@@ -92,32 +99,35 @@ class WarmPoolManager:
             self._active_spawns = max(0, self._active_spawns - 1)
 
     async def _create_one_instance(self) -> SandboxInstance:
-        spec = SandboxSpec(
-            spec_id=f"warm-{uuid.uuid4().hex[:8]}",
-            sandbox_type="stateless",
-            image=settings.image,
-            labels={"sandbox.pool": "warm"},
-            pids_limit=settings.pids_limit,
-            disk_quota_mb=settings.default_workspace_disk_quota_mb,
-            mem_limit=settings.default_mem_limit,
-            cpu_limit=settings.default_cpu_limit,
-        )
-        instance = await self.driver.create_sandbox(spec)
-        self._all_pool_ids.add(instance.sandbox_id)
+        async with self._semaphore:
+            auth_token = generate_daemon_token()
+            spec = SandboxSpec(
+                spec_id=f"warm-{uuid.uuid4().hex[:8]}",
+                sandbox_type="stateless",
+                image=settings.image,
+                labels={"sandbox.pool": "warm"},
+                pids_limit=settings.pids_limit,
+                disk_quota_mb=settings.default_workspace_disk_quota_mb,
+                mem_limit=settings.default_mem_limit,
+                cpu_limit=settings.default_cpu_limit,
+                auth_token=auth_token,
+            )
+            instance = await self.driver.create_sandbox(spec)
+            self._all_pool_ids.add(instance.sandbox_id)
 
-        # Verify readiness
-        ready = await self.driver.healthcheck(instance.endpoint)
-        if not ready:
-            await self.driver.destroy_sandbox(instance.sandbox_id)
-            raise RuntimeError(f"Sandbox {instance.sandbox_id} failed readiness healthcheck")
+            # Verify readiness with auth token
+            ready = await self.driver.healthcheck(instance.endpoint, auth_token=auth_token)
+            if not ready:
+                await self.driver.destroy_sandbox(instance.sandbox_id)
+                self._all_pool_ids.discard(instance.sandbox_id)
+                raise RuntimeError(f"Sandbox {instance.sandbox_id} failed readiness healthcheck")
 
-        return instance
+            return instance
 
     async def stop(self):
         """Drain the pool and destroy all remaining idle containers."""
         self._running = False
         logger.info("Stopping warm pool and cleaning up containers...")
-        # Clean up queue
         while not self.queue.empty():
             try:
                 instance = self.queue.get_nowait()
@@ -126,7 +136,6 @@ class WarmPoolManager:
                 pass
         WARM_POOL_AVAILABLE.set(0)
 
-        # Also destroy all remaining tracked pool IDs
         remaining_ids = list(self._all_pool_ids)
         for s_id in remaining_ids:
             try:

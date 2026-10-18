@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -10,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from ..config import settings
 from ..core.lease_manager import LeaseManager
 from ..core.metrics import ACTIVE_SESSIONS, WORKSPACE_LOCKS_ACTIVE
+from ..core.security import generate_daemon_token, validate_workspace_id, verify_api_key
 from ..drivers.base import ContainerDriver
 from ..models import (
     HeartbeatRequest,
@@ -19,7 +21,11 @@ from ..models import (
     SessionAcquireResponse,
 )
 
-router = APIRouter(prefix="/v1/sessions", tags=["Stateful Sessions"])
+router = APIRouter(
+    prefix="/v1/sessions",
+    tags=["Stateful Sessions"],
+    dependencies=[Depends(verify_api_key)],
+)
 
 
 def get_driver(request: Request) -> ContainerDriver:
@@ -38,12 +44,14 @@ async def acquire_session(
 ) -> SessionAcquireResponse:
     """
     Acquire or resume a stateful agent session with a mounted workspace volume.
-    Enforces atomic workspace concurrency locking: returns 409 Conflict if another active
-    session holds the lock on the specified workspace_id.
+    Enforces strict path validation against directory traversal and atomic concurrency locking.
     """
     session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
     workspace_id = payload.workspace_id
     ttl = payload.ttl_seconds or settings.default_session_ttl
+
+    # Security: Strict validation against directory traversal (e.g. '../..', '/')
+    workspace_dir = validate_workspace_id(workspace_id, settings.workspaces_root)
 
     # Concurrency Lock: Ensure workspace is not held by another active session
     acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
@@ -69,7 +77,7 @@ async def acquire_session(
         existing = await lease_mgr.get(session_id)
         if existing and existing.status == "active":
             # Check if container is still responsive
-            if await driver.healthcheck(existing.endpoint):
+            if await driver.healthcheck(existing.endpoint, auth_token=existing.auth_token):
                 await lease_mgr.heartbeat(session_id, ttl)
                 await lease_mgr.refresh_workspace_lock(workspace_id, session_id, ttl)
                 return SessionAcquireResponse(
@@ -81,9 +89,8 @@ async def acquire_session(
                     status="active",
                 )
 
-        # Prepare persistent workspace directory on host
-        workspace_dir = os.path.join(settings.workspaces_root, workspace_id)
         os.makedirs(workspace_dir, exist_ok=True)
+        auth_token = generate_daemon_token()
 
         # Spawn new stateful sandbox container with cgroup pids & disk quota enforcement
         spec = SandboxSpec(
@@ -94,10 +101,11 @@ async def acquire_session(
             labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id},
             pids_limit=getattr(payload, "pids_limit", None) or settings.pids_limit,
             disk_quota_mb=getattr(payload, "disk_quota_mb", None) or settings.default_workspace_disk_quota_mb,
+            auth_token=auth_token,
         )
 
         instance = await driver.create_sandbox(spec)
-        ready = await driver.healthcheck(instance.endpoint)
+        ready = await driver.healthcheck(instance.endpoint, auth_token=auth_token)
         if not ready:
             await driver.destroy_sandbox(instance.sandbox_id)
             raise HTTPException(status_code=502, detail="Stateful sandbox failed healthcheck")
@@ -109,6 +117,7 @@ async def acquire_session(
             endpoint=instance.endpoint,
             ttl_seconds=ttl,
         )
+        lease.auth_token = auth_token
 
         # Update metrics
         active_leases = await lease_mgr.list_active()
@@ -126,10 +135,8 @@ async def acquire_session(
         )
 
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as e:
-        # On unexpected failure, release workspace lock so it doesn't leak
         await lease_mgr.release_workspace_lock(workspace_id, session_id)
         raise HTTPException(status_code=500, detail=f"Failed to acquire session: {e}")
 
@@ -184,17 +191,17 @@ async def release_session(
 
 
 # =========================================================================
-# Proxied Session APIs (Auto-Heartbeat on each interaction)
+# Proxied Session APIs (Auto-Heartbeat & Keepalive on each interaction)
 # =========================================================================
 
-async def _get_active_session(session_id: str, lease_mgr: LeaseManager) -> str:
+async def _get_active_session(session_id: str, lease_mgr: LeaseManager) -> tuple[str, Optional[str]]:
     lease = await lease_mgr.get(session_id)
     if not lease or lease.status != "active":
         raise HTTPException(status_code=404, detail="Session not found or expired")
     await lease_mgr.heartbeat(session_id)  # Auto-extend lease
     if lease.workspace_id:
         await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id)
-    return lease.endpoint
+    return lease.endpoint, lease.auth_token
 
 
 @router.post("/{session_id}/exec")
@@ -203,24 +210,41 @@ async def proxy_exec(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
     body = await request.json()
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
     if body.get("stream", False):
         client = httpx.AsyncClient(timeout=None)
+        stop_keepalive = asyncio.Event()
+
+        # Background keepalive task to keep long-running streaming commands alive
+        async def keepalive_loop():
+            while not stop_keepalive.is_set():
+                try:
+                    await asyncio.wait_for(stop_keepalive.wait(), timeout=15.0)
+                    break
+                except asyncio.TimeoutError:
+                    await lease_mgr.heartbeat(session_id)
+
+        keepalive_task = asyncio.create_task(keepalive_loop())
 
         async def stream_generator():
             try:
-                async with client.stream("POST", f"{endpoint}/exec", json=body) as r:
+                async with client.stream("POST", f"{endpoint}/exec", json=body, headers=headers) as r:
                     async for chunk in r.aiter_bytes():
                         yield chunk
             finally:
+                stop_keepalive.set()
+                keepalive_task.cancel()
                 await client.aclose()
 
         return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        resp = await client.post(f"{endpoint}/exec", json=body)
+    # Buffered execution with auto-keepalive
+    timeout_val = float(body.get("timeout", 300.0))
+    async with httpx.AsyncClient(timeout=timeout_val + 10.0) as client:
+        resp = await client.post(f"{endpoint}/exec", json=body, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 
@@ -230,10 +254,11 @@ async def proxy_fs_write(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     body = await request.json()
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(f"{endpoint}/fs/write", json=body)
+        resp = await client.post(f"{endpoint}/fs/write", json=body, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 
@@ -243,9 +268,10 @@ async def proxy_fs_read(
     path: str,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{endpoint}/fs/read", params={"path": path})
+        resp = await client.get(f"{endpoint}/fs/read", params={"path": path}, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 
@@ -255,9 +281,10 @@ async def proxy_fs_list(
     path: str = ".",
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{endpoint}/fs/list", params={"path": path})
+        resp = await client.get(f"{endpoint}/fs/list", params={"path": path}, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 
@@ -267,10 +294,11 @@ async def proxy_fs_delete(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     body = await request.json()
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(f"{endpoint}/fs/delete", json=body)
+        resp = await client.post(f"{endpoint}/fs/delete", json=body, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 
@@ -280,7 +308,8 @@ async def proxy_fs_quota(
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
     """Retrieve workspace disk quota metrics (used, quota, usage percentage)."""
-    endpoint = await _get_active_session(session_id, lease_mgr)
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{endpoint}/fs/quota")
+        resp = await client.get(f"{endpoint}/fs/quota", headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
