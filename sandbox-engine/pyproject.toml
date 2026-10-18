@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     "docker>=7.0.0",
     "kubernetes-asyncio>=33.0.0",
+    "asyncpg>=0.29.0",
 ]
 
 [project.optional-dependencies]

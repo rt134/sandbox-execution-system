@@ -1,6 +1,24 @@
 version: "3.8"
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sandbox-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sandbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sandbox}
+      POSTGRES_DB: ${POSTGRES_DB:-sandbox}
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sandbox -d sandbox"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     container_name: sandbox-redis
@@ -28,6 +46,7 @@ services:
       - "8080:8080"
     environment:
       - SANDBOX_DRIVER=docker
+      - SANDBOX_POSTGRES_URL=postgresql://sandbox:sandbox@postgres:5432/sandbox
       - SANDBOX_REDIS_URL=redis://redis:6379/0
       - SANDBOX_WARM_POOL_SIZE=2
       - SANDBOX_HTTP_PROXY=http://squid:3128
@@ -36,10 +55,15 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - workspaces-data:/workspaces
     depends_on:
-      - redis
-      - squid
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      squid:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
+  postgres-data:
   redis-data:
   workspaces-data:

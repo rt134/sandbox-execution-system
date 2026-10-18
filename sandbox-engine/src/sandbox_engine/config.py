@@ -28,14 +28,40 @@ class EngineSettings(BaseSettings):
     warm_pool_acquire_timeout: float = 5.0
     max_concurrent_spawns: int = 10  # Cap concurrent container launches
 
+    # Environment & Persistence (PostgreSQL)
+    environment: str = os.environ.get("ENV", os.environ.get("ENVIRONMENT", "development"))
+    postgres_url: Optional[str] = (
+        os.environ.get("SANDBOX_POSTGRES_URL")
+        or os.environ.get("POSTGRES_URL")
+        or os.environ.get("DATABASE_URL")
+    )
+    default_local_postgres_url: str = "postgresql://sandbox:sandbox@localhost:5432/sandbox"
+
     # Stateful Session Configurations
     default_session_ttl: int = 300
     sweeper_interval_sec: float = 5.0
     orphan_grace_period_sec: float = 60.0  # Prevent sweeper race on freshly created containers
     workspaces_root: str = os.path.abspath(".workspaces")
-    redis_url: Optional[str] = "redis://localhost:6379/0"
+    redis_url: Optional[str] = None  # Optional secondary cache/coordination
     sqlite_path: str = ".sandbox_ledger.db"
-    require_redis: bool = False  # If True, refuse silent fallback to SQLite in multi-replica setup
+    require_redis: bool = False  # If True, refuse silent fallback
+
+    def get_effective_postgres_url(self) -> Optional[str]:
+        """
+        Returns the PostgreSQL connection string.
+        In production, requires the connection URL to be provided via ENV.
+        In development, defaults to the local Docker PostgreSQL container.
+        """
+        if self.postgres_url:
+            return self.postgres_url
+
+        if self.environment.lower() in ("production", "prod"):
+            raise ValueError(
+                "Production environment requires PostgreSQL database URL! "
+                "Please set SANDBOX_POSTGRES_URL, POSTGRES_URL, or DATABASE_URL in your environment."
+            )
+
+        return self.default_local_postgres_url
 
     # Egress Proxy Configurations (Squid)
     http_proxy: Optional[str] = None
