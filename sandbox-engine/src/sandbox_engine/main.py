@@ -85,6 +85,25 @@ async def healthz():
     }
 
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from fastapi.responses import Response
+from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
+
+
+@app.get("/metrics", tags=["Observability"])
+async def get_metrics():
+    """Prometheus metrics endpoint for scraping."""
+    if hasattr(app.state, "warm_pool") and app.state.warm_pool:
+        WARM_POOL_AVAILABLE.set(app.state.warm_pool.queue.qsize())
+    if hasattr(app.state, "lease_manager") and app.state.lease_manager:
+        active_leases = await app.state.lease_manager.list_active()
+        ACTIVE_SESSIONS.set(len(active_leases))
+        active_locks = await app.state.lease_manager.count_active_locks()
+        WORKSPACE_LOCKS_ACTIVE.set(active_locks)
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("sandbox_engine.main:app", host=settings.host, port=settings.port, reload=False)

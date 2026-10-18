@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 import uuid
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -8,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..core.lease_manager import LeaseManager
+from ..core.metrics import ACTIVE_SESSIONS, WORKSPACE_LOCKS_ACTIVE
 from ..drivers.base import ContainerDriver
 from ..models import (
     HeartbeatRequest,
@@ -36,61 +38,100 @@ async def acquire_session(
 ) -> SessionAcquireResponse:
     """
     Acquire or resume a stateful agent session with a mounted workspace volume.
+    Enforces atomic workspace concurrency locking: returns 409 Conflict if another active
+    session holds the lock on the specified workspace_id.
     """
     session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
     workspace_id = payload.workspace_id
     ttl = payload.ttl_seconds or settings.default_session_ttl
 
-    # Check for existing active lease to reattach
-    existing = await lease_mgr.get(session_id)
-    if existing and existing.status == "active":
-        # Check if container is still responsive
-        if await driver.healthcheck(existing.endpoint):
-            await lease_mgr.heartbeat(session_id, ttl)
-            return SessionAcquireResponse(
-                session_id=existing.session_id,
-                workspace_id=existing.workspace_id,
-                sandbox_id=existing.sandbox_id,
-                endpoint=existing.endpoint,
-                expires_at=existing.expires_at,
-                status="active",
-            )
-
-    # Prepare persistent workspace directory on host
-    workspace_dir = os.path.join(settings.workspaces_root, workspace_id)
-    os.makedirs(workspace_dir, exist_ok=True)
-
-    # Spawn new stateful sandbox container
-    spec = SandboxSpec(
-        spec_id=session_id,
-        sandbox_type="stateful",
-        image=settings.image,
-        workspace_path=workspace_dir,
-        labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id},
-    )
-
-    instance = await driver.create_sandbox(spec)
-    ready = await driver.healthcheck(instance.endpoint)
-    if not ready:
-        await driver.destroy_sandbox(instance.sandbox_id)
-        raise HTTPException(status_code=502, detail="Stateful sandbox failed healthcheck")
-
-    lease = await lease_mgr.create_or_renew(
-        session_id=session_id,
+    # Concurrency Lock: Ensure workspace is not held by another active session
+    acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
         workspace_id=workspace_id,
-        sandbox_id=instance.sandbox_id,
-        endpoint=instance.endpoint,
+        session_id=session_id,
         ttl_seconds=ttl,
     )
+    if not acquired:
+        remaining = max(0.0, expires_at - time.time()) if expires_at else 0.0
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Workspace is currently locked by another active session",
+                "workspace_id": workspace_id,
+                "locked_by": locked_by,
+                "expires_at": expires_at,
+                "ttl_remaining_sec": round(remaining, 1),
+            },
+        )
 
-    return SessionAcquireResponse(
-        session_id=lease.session_id,
-        workspace_id=lease.workspace_id,
-        sandbox_id=lease.sandbox_id,
-        endpoint=lease.endpoint,
-        expires_at=lease.expires_at,
-        status="active",
-    )
+    try:
+        # Check for existing active lease to reattach
+        existing = await lease_mgr.get(session_id)
+        if existing and existing.status == "active":
+            # Check if container is still responsive
+            if await driver.healthcheck(existing.endpoint):
+                await lease_mgr.heartbeat(session_id, ttl)
+                await lease_mgr.refresh_workspace_lock(workspace_id, session_id, ttl)
+                return SessionAcquireResponse(
+                    session_id=existing.session_id,
+                    workspace_id=existing.workspace_id,
+                    sandbox_id=existing.sandbox_id,
+                    endpoint=existing.endpoint,
+                    expires_at=existing.expires_at,
+                    status="active",
+                )
+
+        # Prepare persistent workspace directory on host
+        workspace_dir = os.path.join(settings.workspaces_root, workspace_id)
+        os.makedirs(workspace_dir, exist_ok=True)
+
+        # Spawn new stateful sandbox container with cgroup pids & disk quota enforcement
+        spec = SandboxSpec(
+            spec_id=session_id,
+            sandbox_type="stateful",
+            image=settings.image,
+            workspace_path=workspace_dir,
+            labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id},
+            pids_limit=getattr(payload, "pids_limit", None) or settings.pids_limit,
+            disk_quota_mb=getattr(payload, "disk_quota_mb", None) or settings.default_workspace_disk_quota_mb,
+        )
+
+        instance = await driver.create_sandbox(spec)
+        ready = await driver.healthcheck(instance.endpoint)
+        if not ready:
+            await driver.destroy_sandbox(instance.sandbox_id)
+            raise HTTPException(status_code=502, detail="Stateful sandbox failed healthcheck")
+
+        lease = await lease_mgr.create_or_renew(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            sandbox_id=instance.sandbox_id,
+            endpoint=instance.endpoint,
+            ttl_seconds=ttl,
+        )
+
+        # Update metrics
+        active_leases = await lease_mgr.list_active()
+        ACTIVE_SESSIONS.set(len(active_leases))
+        active_locks = await lease_mgr.count_active_locks()
+        WORKSPACE_LOCKS_ACTIVE.set(active_locks)
+
+        return SessionAcquireResponse(
+            session_id=lease.session_id,
+            workspace_id=lease.workspace_id,
+            sandbox_id=lease.sandbox_id,
+            endpoint=lease.endpoint,
+            expires_at=lease.expires_at,
+            status="active",
+        )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # On unexpected failure, release workspace lock so it doesn't leak
+        await lease_mgr.release_workspace_lock(workspace_id, session_id)
+        raise HTTPException(status_code=500, detail=f"Failed to acquire session: {e}")
 
 
 @router.post("/{session_id}/heartbeat", response_model=HeartbeatResponse)
@@ -99,11 +140,15 @@ async def session_heartbeat(
     payload: HeartbeatRequest = None,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ) -> HeartbeatResponse:
-    """Send sliding heartbeat to keep the session alive."""
+    """Send sliding heartbeat to keep the session alive and refresh workspace lock."""
     ttl = payload.ttl_seconds if payload else None
     lease = await lease_mgr.heartbeat(session_id, ttl)
     if not lease:
         raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    if lease.workspace_id:
+        await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id, ttl)
+
     return HeartbeatResponse(
         session_id=lease.session_id,
         expires_at=lease.expires_at,
@@ -117,14 +162,23 @@ async def release_session(
     driver: ContainerDriver = Depends(get_driver),
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    """Explicitly release and terminate a session while keeping the workspace intact."""
+    """Explicitly release and terminate a session while releasing the workspace concurrency lock."""
     lease = await lease_mgr.get(session_id)
     if not lease:
         raise HTTPException(status_code=404, detail="Session not found")
 
     await lease_mgr.release(session_id)
+    if lease.workspace_id:
+        await lease_mgr.release_workspace_lock(lease.workspace_id, session_id)
+
     if lease.sandbox_id:
         await driver.destroy_sandbox(lease.sandbox_id)
+
+    # Update metrics
+    active_leases = await lease_mgr.list_active()
+    ACTIVE_SESSIONS.set(len(active_leases))
+    active_locks = await lease_mgr.count_active_locks()
+    WORKSPACE_LOCKS_ACTIVE.set(active_locks)
 
     return {"status": "released", "session_id": session_id}
 
@@ -138,6 +192,8 @@ async def _get_active_session(session_id: str, lease_mgr: LeaseManager) -> str:
     if not lease or lease.status != "active":
         raise HTTPException(status_code=404, detail="Session not found or expired")
     await lease_mgr.heartbeat(session_id)  # Auto-extend lease
+    if lease.workspace_id:
+        await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id)
     return lease.endpoint
 
 
@@ -215,4 +271,16 @@ async def proxy_fs_delete(
     body = await request.json()
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(f"{endpoint}/fs/delete", json=body)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+
+
+@router.get("/{session_id}/fs/quota")
+async def proxy_fs_quota(
+    session_id: str,
+    lease_mgr: LeaseManager = Depends(get_lease_manager),
+):
+    """Retrieve workspace disk quota metrics (used, quota, usage percentage)."""
+    endpoint = await _get_active_session(session_id, lease_mgr)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{endpoint}/fs/quota")
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))

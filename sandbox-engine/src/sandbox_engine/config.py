@@ -44,5 +44,12 @@ class EngineSettings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
 
+    # Resource & Security Limits
+    pids_limit: int = 256  # Fork-bomb prevention: cgroup pids.max
+    default_mem_limit: str = "512m"
+    default_cpu_limit: float = 1.0
+    default_workspace_disk_quota_mb: int = 1024  # 1GB disk quota
+    enable_prometheus_metrics: bool = True
+
 
 settings = EngineSettings()

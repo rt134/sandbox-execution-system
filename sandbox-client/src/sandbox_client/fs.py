@@ -4,7 +4,7 @@ import base64
 from typing import List, Union
 import httpx
 
-from .models import FileInfo, SandboxError
+from .models import DiskQuotaExceededError, FileInfo, SandboxError
 
 
 class FileSystemClient:
@@ -28,6 +28,8 @@ class FileSystemClient:
             f"{self.base_url}/v1/sessions/{self.session_id}/fs/write",
             json={"path": path, "content": payload_content, "is_base64": is_base64},
         )
+        if resp.status_code == 413:
+            raise DiskQuotaExceededError(f"Workspace disk quota exceeded: {resp.text}")
         if resp.status_code != 200:
             raise SandboxError(f"Failed to write file '{path}': {resp.text}")
 
@@ -81,3 +83,13 @@ class FileSystemClient:
         )
         if resp.status_code != 200:
             raise SandboxError(f"Failed to delete '{path}': {resp.text}")
+
+    async def quota(self) -> dict:
+        """Get workspace disk usage and quota details."""
+        resp = await self._http.get(
+            f"{self.base_url}/v1/sessions/{self.session_id}/fs/quota"
+        )
+        if resp.status_code != 200:
+            raise SandboxError(f"Failed to get workspace quota: {resp.text}")
+        return resp.json()
+

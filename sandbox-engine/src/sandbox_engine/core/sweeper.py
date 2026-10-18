@@ -7,6 +7,7 @@ from typing import Optional
 from ..config import settings
 from ..drivers.base import ContainerDriver
 from .lease_manager import LeaseManager
+from .metrics import ACTIVE_SESSIONS, SWEEPER_RECLAIMS_TOTAL, WORKSPACE_LOCKS_ACTIVE
 
 logger = logging.getLogger("sandbox.sweeper")
 
@@ -14,7 +15,7 @@ logger = logging.getLogger("sandbox.sweeper")
 class Sweeper:
     """
     Background garbage collection task.
-    Reconciles expired leases and leaked containers every N seconds.
+    Reconciles expired leases, cleans up workspace locks, and reclaims leaked containers.
     """
 
     def __init__(
@@ -64,12 +65,18 @@ class Sweeper:
             try:
                 if lease.sandbox_id:
                     await self.driver.destroy_sandbox(lease.sandbox_id)
+                SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
             except Exception as e:
                 logger.error(f"Failed to destroy sandbox {lease.sandbox_id}: {e}")
             finally:
+                if lease.workspace_id:
+                    await self.lease_manager.release_workspace_lock(lease.workspace_id, lease.session_id)
                 await self.lease_manager.mark_expired(lease.session_id)
 
-        # 2. Orphan container garbage collection
+        # 2. Reconcile any orphaned workspace locks
+        await self.lease_manager.cleanup_expired_workspace_locks()
+
+        # 3. Orphan container garbage collection
         try:
             active_leases = await self.lease_manager.list_active()
             active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id}
@@ -79,6 +86,16 @@ class Sweeper:
             for sbx in running_sandboxes:
                 if sbx.sandbox_id not in active_sandbox_ids:
                     logger.warning(f"🧹 [Sweeper] Found orphan stateful container '{sbx.sandbox_id}'. Destroying...")
-                    await self.driver.destroy_sandbox(sbx.sandbox_id)
+                    try:
+                        await self.driver.destroy_sandbox(sbx.sandbox_id)
+                        SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_container").inc()
+                    except Exception as e:
+                        logger.error(f"Failed to destroy orphan container {sbx.sandbox_id}: {e}")
+
+            # Update Prometheus gauges
+            ACTIVE_SESSIONS.set(len(active_leases))
+            active_locks = await self.lease_manager.count_active_locks()
+            WORKSPACE_LOCKS_ACTIVE.set(active_locks)
+
         except Exception as e:
             logger.error(f"Error checking orphan sandboxes: {e}")

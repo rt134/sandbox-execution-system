@@ -59,3 +59,13 @@ class SandboxError(Exception):
 class ExecutionTimeoutError(SandboxError):
     """Raised when code execution times out."""
     pass
+
+
+class WorkspaceConflictError(SandboxError):
+    """Raised when a workspace is concurrently locked by another active session (HTTP 409)."""
+    pass
+
+
+class DiskQuotaExceededError(SandboxError):
+    """Raised when a file write exceeds the workspace disk quota (HTTP 413)."""
+    pass

@@ -14,6 +14,8 @@ class SandboxSpec(BaseModel):
     workspace_path: Optional[str] = None
     cpu_limit: float = 1.0
     mem_limit: str = "512m"
+    pids_limit: int = 256
+    disk_quota_mb: int = 1024
 
 
 class SandboxInstance(BaseModel):

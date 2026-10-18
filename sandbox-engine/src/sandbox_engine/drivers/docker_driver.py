@@ -50,16 +50,25 @@ class DockerDriver(ContainerDriver):
         # Dynamic free port allocation: bind to 127.0.0.1 with random port
         ports = {"5004/tcp": ("127.0.0.1", None)}
 
+        env = {
+            "WORKSPACE_DISK_QUOTA_MB": str(spec.disk_quota_mb),
+            **spec.env,
+        }
+
         runtime = settings.docker_runtime
         kwargs = {
             "image": spec.image,
             "detach": True,
             "labels": labels,
-            "environment": spec.env,
+            "environment": env,
             "volumes": volumes,
             "ports": ports,
             "network": settings.docker_network,
+            "pids_limit": spec.pids_limit,
         }
+        if spec.mem_limit:
+            kwargs["mem_limit"] = spec.mem_limit
+            kwargs["memswap_limit"] = spec.mem_limit
 
         # If gVisor runsc is specified and supported, use it; otherwise fallback to default runc
         if runtime and runtime != "runc":

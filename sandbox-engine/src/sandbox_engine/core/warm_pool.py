@@ -9,6 +9,7 @@ import httpx
 from ..config import settings
 from ..drivers.base import ContainerDriver
 from ..models import SandboxInstance, SandboxSpec
+from .metrics import WARM_POOL_ACQUISITIONS_TOTAL, WARM_POOL_AVAILABLE
 
 logger = logging.getLogger("sandbox.warm_pool")
 
@@ -33,6 +34,7 @@ class WarmPoolManager:
         logger.info(f"Starting Warm Pool with target size {self.target_size} using {settings.driver} driver...")
         spawn_tasks = [self._spawn_warm_instance() for _ in range(self.target_size)]
         await asyncio.gather(*spawn_tasks, return_exceptions=True)
+        WARM_POOL_AVAILABLE.set(self.queue.qsize())
         logger.info(f"Warm Pool ready! Available instances in queue: {self.queue.qsize()}")
 
     async def acquire(self, timeout: float = 5.0) -> SandboxInstance:
@@ -43,12 +45,14 @@ class WarmPoolManager:
         try:
             instance = await asyncio.wait_for(self.queue.get(), timeout=timeout)
             logger.debug(f"Acquired warm sandbox {instance.sandbox_id}. Queue remaining: {self.queue.qsize()}")
+            WARM_POOL_ACQUISITIONS_TOTAL.labels(result="hit").inc()
+            WARM_POOL_AVAILABLE.set(self.queue.qsize())
             # Immediately trigger replenish in the background
             self.trigger_replenish()
             return instance
         except asyncio.TimeoutError:
             logger.warning("Warm pool queue empty! Spawning on-demand sandbox...")
-            # If queue is depleted under burst, spawn on demand
+            WARM_POOL_ACQUISITIONS_TOTAL.labels(result="miss").inc()
             instance = await self._create_one_instance()
             self.trigger_replenish()
             return instance
@@ -80,6 +84,7 @@ class WarmPoolManager:
         try:
             instance = await self._create_one_instance()
             await self.queue.put(instance)
+            WARM_POOL_AVAILABLE.set(self.queue.qsize())
             logger.debug(f"Replenished warm sandbox {instance.sandbox_id}. Queue size now: {self.queue.qsize()}")
         except Exception as e:
             logger.error(f"Error spawning warm sandbox: {e}")
@@ -92,6 +97,10 @@ class WarmPoolManager:
             sandbox_type="stateless",
             image=settings.image,
             labels={"sandbox.pool": "warm"},
+            pids_limit=settings.pids_limit,
+            disk_quota_mb=settings.default_workspace_disk_quota_mb,
+            mem_limit=settings.default_mem_limit,
+            cpu_limit=settings.default_cpu_limit,
         )
         instance = await self.driver.create_sandbox(spec)
         self._all_pool_ids.add(instance.sandbox_id)
@@ -115,6 +124,7 @@ class WarmPoolManager:
                 await self.driver.destroy_sandbox(instance.sandbox_id)
             except Exception:
                 pass
+        WARM_POOL_AVAILABLE.set(0)
 
         # Also destroy all remaining tracked pool IDs
         remaining_ids = list(self._all_pool_ids)

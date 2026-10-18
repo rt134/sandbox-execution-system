@@ -58,14 +58,24 @@ class KubernetesDriver(ContainerDriver):
         ]
         node_selector = {settings.k8s_node_selector_key: settings.k8s_node_selector_value}
 
+        # Container environment
+        container_env = [
+            client.V1EnvVar(name="WORKSPACE_DISK_QUOTA_MB", value=str(spec.disk_quota_mb))
+        ]
+        container_env.extend([client.V1EnvVar(name=k, value=v) for k, v in spec.env.items()])
+
         # Container spec
         container = client.V1Container(
             name="sandbox-kernel",
             image=spec.image,
             ports=[client.V1ContainerPort(container_port=5004)],
-            env=[client.V1EnvVar(name=k, value=v) for k, v in spec.env.items()],
+            env=container_env,
             resources=client.V1ResourceRequirements(
-                limits={"cpu": str(spec.cpu_limit), "memory": spec.mem_limit},
+                limits={
+                    "cpu": str(spec.cpu_limit),
+                    "memory": spec.mem_limit,
+                    "ephemeral-storage": f"{spec.disk_quota_mb}Mi",
+                },
                 requests={"cpu": "100m", "memory": "128m"},
             ),
         )
