@@ -212,7 +212,7 @@ class SQLiteLeaseBackend(LeaseBackend):
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status FROM leases WHERE status = 'active' AND expires_at < ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at < ?",
                 (now,),
             )
             rows = cursor.fetchall()
@@ -225,6 +225,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     created_at=r[4],
                     expires_at=r[5],
                     status=r[6],
+                    auth_token=r[7] if len(r) > 7 else None,
                 )
                 for r in rows
             ]
@@ -236,7 +237,7 @@ class SQLiteLeaseBackend(LeaseBackend):
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status FROM leases WHERE status = 'active' AND expires_at >= ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at >= ?",
                 (now,),
             )
             rows = cursor.fetchall()
@@ -249,6 +250,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     created_at=r[4],
                     expires_at=r[5],
                     status=r[6],
+                    auth_token=r[7] if len(r) > 7 else None,
                 )
                 for r in rows
             ]
@@ -360,7 +362,7 @@ class RedisLeaseBackend(LeaseBackend):
         self.redis = redis_client
 
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int
+        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
     ) -> LeaseRecord:
         now = time.time()
         expires_at = now + ttl_seconds
@@ -372,7 +374,9 @@ class RedisLeaseBackend(LeaseBackend):
             created_at=now,
             expires_at=expires_at,
             status="active",
+            auth_token=auth_token,
         )
+
         data = record.model_dump_json()
         await self.redis.set(f"lease:{session_id}", data, ex=ttl_seconds)
         await self.redis.sadd("leases:active", session_id)
@@ -540,10 +544,17 @@ class LeaseManager:
         self._backend = SQLiteLeaseBackend(settings.sqlite_path)
 
     async def create_or_renew(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: Optional[int] = None
+        self,
+        session_id: str,
+        workspace_id: str,
+        sandbox_id: str,
+        endpoint: str,
+        ttl_seconds: Optional[int] = None,
+        auth_token: Optional[str] = None,
     ) -> LeaseRecord:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
-        return await self._backend.create_or_renew_lease(session_id, workspace_id, sandbox_id, endpoint, ttl)
+        return await self._backend.create_or_renew_lease(session_id, workspace_id, sandbox_id, endpoint, ttl, auth_token=auth_token)
+
 
     async def heartbeat(self, session_id: str, ttl_seconds: Optional[int] = None) -> Optional[LeaseRecord]:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl

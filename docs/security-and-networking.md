@@ -1,6 +1,6 @@
-# Security & SSRF Mitigation
+# Security & Zero-Trust Architecture
 
-Executing untrusted AI-generated code requires **defense-in-depth across the kernel, network, and filesystem**. The Sandbox Execution System combines gVisor userspace kernel isolation with strict egress proxy filtering.
+Executing untrusted AI-generated code requires **defense-in-depth across the kernel, network, authentication, and filesystem boundaries**. The Sandbox Execution System combines gVisor userspace kernel isolation with strict egress proxy filtering, token-based daemon authentication, path canonicalization, and cgroup resource limits.
 
 ---
 
@@ -8,16 +8,47 @@ Executing untrusted AI-generated code requires **defense-in-depth across the ker
 
 | Threat | Attack Vector | System Defense |
 | :--- | :--- | :--- |
-| **Container Breakout** | Linux kernel 0-day exploit / privilege escalation | **gVisor (`runsc`)**: Untrusted code never executes syscalls directly on the host kernel. All calls are trapped in Go userspace. |
-| **SSRF (Cloud Metadata)** | Code queries `http://169.254.169.254` to steal AWS/GCP IAM roles | **Squid Egress Proxy**: Explicitly denies `169.254.169.254/32` and `169.254.0.0/16`. |
-| **Internal Lateral Movement** | Code scans internal VPC (`10.0.0.0/8`, `192.168.0.0/16`) or K8s API | **Squid + NetworkPolicy**: Blocks all RFC 1918 private subnets and K8s Service CIDRs (`10.96.0.0/12`). |
+| **Container Breakout** | Linux kernel 0-day exploit / privilege escalation | **gVisor (`runsc`)**: Untrusted code never executes syscalls directly on the host kernel. All calls are trapped in Go userspace. Silent fallback is disabled (`allow_runtime_fallback=False`). |
+| **Privilege Escalation** | Code attempts `setuid` binaries (`su`, `sudo`, `ping`) | **Capabilities & Privileges**: All Linux capabilities are dropped (`cap_drop=["ALL"]`) and `no-new-privileges:true` is enforced on every container. |
+| **Fork Bomb (Host DoS)** | `:(){ :|:& };:` or `os.fork()` recursion exhausting host PID table | **cgroups PID Controller (`pids_limit`)**: Containers are capped at 256 PIDs. Any attempt to fork beyond limit returns `EAGAIN` ("Resource temporarily unavailable"). |
+| **Disk Exhaustion (Host DoS)**| `cat /dev/zero > file` or infinite log generation | **Disk Quota Enforcement**: `shellctl` checks workspace disk usage before every write and rejects payloads exceeding quota with `HTTP 413 Payload Too Large`. |
+| **Host Filesystem Traversal** | Agent crafts `workspace_id="../.."` or `../../etc/shadow` | **Path Traversal Defense**: `workspace_id` is validated against `^[a-zA-Z0-9_\-]{1,64}$` and canonical `os.path.realpath` is verified against `workspaces_root`. |
+| **SSRF (Cloud Metadata)** | Code queries `http://169.254.169.254` to steal AWS/GCP IAM roles | **Squid Egress Proxy**: Explicitly denies `169.254.169.254/32` and `169.254.0.0/16`. Sandboxes inherit `http_proxy`/`https_proxy` environment variables. |
+| **Lateral Movement Between Sandboxes** | Malicious code in Sandbox A attacks daemon on Sandbox B | **Internal Daemon Token Authentication**: Every sandbox is assigned a cryptographically unique `SHELLCTL_AUTH_TOKEN`. `shellctl` rejects requests without `Authorization: Bearer <token>`. |
+| **Unauthenticated API Access** | Open access to Engine REST and WebSocket endpoints | **API Key Authentication**: Engine validates `Authorization: Bearer <key>` or `X-API-Key` on all endpoints and WebSocket handshakes. |
 | **K8s Cluster Compromise** | Container accesses `/var/run/secrets/kubernetes.io` | **Pod Spec Lockdown**: `automountServiceAccountToken: false` is enforced on all sandbox Pods. |
 | **Host Workload Contamination** | Sandbox co-located on nodes running DB or Core APIs | **Dedicated Tainted Node Pool**: Nodes tainted `sandbox=true:NoSchedule`. |
-| **Host Filesystem Traversal** | Agent crafts `../../etc/shadow` path in file APIs | **Path Sanitization**: `shellctl` enforces strict prefix validation against `/workspace`. |
 
 ---
 
-## 2. Kernel Isolation: gVisor (`runsc`)
+## 2. Authentication & Authorization Architecture
+
+```
+User / Agent Caller
+       │
+       │ HTTP / WebSocket with Authorization: Bearer <API_KEY>
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Sandbox Engine (FastAPI)                                    │
+│  • Validates API Key via constant-time comparison            │
+│  • Validates workspace_id against directory traversal        │
+│  • Enforces atomic workspace concurrency locking             │
+│  • Injects per-container internal SHELLCTL_AUTH_TOKEN        │
+└──────────────────────────────────────────────────────────────┘
+       │
+       │ Direct container call with Authorization: Bearer <DAEMON_TOKEN>
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  In-Container Daemon (shellctl :5004)                        │
+│  • Verifies daemon auth token before executing any command   │
+│  • Bound to 127.0.0.1 or isolated overlay network            │
+│  • Zero lateral access from adjacent containers             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Kernel Isolation: gVisor (`runsc`)
 
 ```
 Untrusted User / Agent Code
@@ -36,13 +67,13 @@ Untrusted User / Agent Code
 └──────────────────────────────────────────────┘
 ```
 
-In production, sandboxes specify `runtime: runsc` (in Docker) or `runtimeClassName: gvisor` (in Kubernetes).
+In production, sandboxes specify `runtime: runsc` (in Docker) or `runtimeClassName: gvisor` (in Kubernetes). If `runsc` is unavailable, the engine fails fast by default rather than silently downgrading to `runc`.
 
 ---
 
-## 3. Network Egress Firewall: Squid SSRF Proxy
+## 4. Network Egress Firewall: Squid SSRF Proxy
 
-All sandboxes are placed on an isolated network where direct outbound routing to the internet is blocked. Outbound HTTP/HTTPS traffic must traverse the Squid proxy (`deploy/squid/squid.conf`):
+All sandboxes route outbound HTTP/HTTPS traffic through the Squid proxy (`deploy/squid/squid.conf`):
 
 ```squid
 # ------------------------------------------
@@ -77,13 +108,15 @@ http_access allow Safe_ports
 
 ---
 
-## 4. Kubernetes `NetworkPolicy`
+## 5. Kubernetes `NetworkPolicy`
+
+Located in `k8s/network-policy.yaml`:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: sandbox-isolation
+  name: sandbox-isolation-policy
   namespace: sandboxes
 spec:
   podSelector:
@@ -95,22 +128,36 @@ spec:
   ingress:
     # Only allow sandbox-engine to connect to container port 5004
     - from:
-        - podSelector:
+        - namespaceSelector:
             matchLabels:
-              app: sandbox-engine
+              kubernetes.io/metadata.name: sandbox-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbox-engine
       ports:
         - protocol: TCP
           port: 5004
   egress:
-    # Only allow DNS (port 53) and the Squid proxy (port 3128)
+    # 1. Allow CoreDNS (port 53)
     - to:
-        - podSelector:
+        - namespaceSelector: {}
+          podSelector:
             matchLabels:
-              app: squid-proxy
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. Allow Egress ONLY to Squid Proxy (port 3128)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: sandbox-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: squid-proxy
       ports:
         - protocol: TCP
           port: 3128
-    - ports:
-        - protocol: UDP
-          port: 53
 ```

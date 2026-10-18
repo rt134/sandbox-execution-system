@@ -116,8 +116,9 @@ async def acquire_session(
             sandbox_id=instance.sandbox_id,
             endpoint=instance.endpoint,
             ttl_seconds=ttl,
+            auth_token=auth_token,
         )
-        lease.auth_token = auth_token
+
 
         # Update metrics
         active_leases = await lease_mgr.list_active()
