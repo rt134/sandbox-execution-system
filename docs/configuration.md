@@ -26,14 +26,16 @@ All environment variables use the `SANDBOX_` prefix.
 | `SANDBOX_WARM_POOL_SIZE` | `integer` | `2` | Number of pre-warmed idle containers kept in memory for stateless instant execution. |
 | `SANDBOX_WARM_POOL_ACQUIRE_TIMEOUT` | `float` | `5.0` | Seconds to wait for a warm container before spawning on-demand. |
 | `SANDBOX_MAX_CONCURRENT_SPAWNS` | `integer` | `10` | Bounded semaphore cap on simultaneous container spawns to prevent host thrashing. |
-| **Stateful Sessions & Persistence** | | | |
+| **Stateful Sessions & Persistent Data Source (PostgreSQL)** | | | |
+| `SANDBOX_POSTGRES_URL` | `string` | `"postgresql://sandbox:sandbox@localhost:5432/sandbox"` (local) | Primary PostgreSQL connection URL for all persistent state (leases, atomic locks, audit logs). Aliases: `POSTGRES_URL`, `DATABASE_URL`. |
+| `ENV` / `SANDBOX_ENVIRONMENT`| `string` | `"development"` | Environment mode: `"development"`, `"production"`. In `"production"`, database URL is strictly required in ENV. |
 | `SANDBOX_DEFAULT_SESSION_TTL` | `integer` | `300` | Inactivity lease timeout in seconds before auto-reclamation. |
 | `SANDBOX_SWEEPER_INTERVAL_SEC` | `float` | `5.0` | Frequency in seconds of the background garbage collector reconciliation loop. |
 | `SANDBOX_ORPHAN_GRACE_PERIOD_SEC` | `float` | `60.0` | Grace period in seconds before the sweeper will reclaim an unleased container (prevents races on newborn sessions). |
 | `SANDBOX_WORKSPACES_ROOT` | `string` | `".workspaces"` | Canonical host directory where agent workspace volumes are stored. |
-| `SANDBOX_REDIS_URL` | `string` | `"redis://localhost:6379/0"` | Redis connection URL for distributed lease and lock management across multiple replicas. |
-| `SANDBOX_REQUIRE_REDIS` | `boolean` | `false` | When `true`, refuses silent SQLite fallback if Redis is unavailable. Required for multi-replica deployments. |
-| `SANDBOX_SQLITE_PATH` | `string` | `".sandbox_ledger.db"` | SQLite database path used for single-node local development. |
+| `SANDBOX_REDIS_URL` | `string` | `None` | Optional secondary Redis connection URL. |
+| `SANDBOX_REQUIRE_REDIS` | `boolean` | `false` | When `true`, refuses silent SQLite fallback if Redis is configured. |
+| `SANDBOX_SQLITE_PATH` | `string` | `".sandbox_ledger.db"` | SQLite database path used only for offline development/testing fallback. |
 | **Egress Proxying (SSRF Firewall)** | | | |
 | `SANDBOX_HTTP_PROXY` | `string` | `None` | Outbound HTTP proxy URL injected into sandboxes (e.g., `http://squid:3128`). |
 | `SANDBOX_HTTPS_PROXY` | `string` | `None` | Outbound HTTPS proxy URL injected into sandboxes (e.g., `http://squid:3128`). |
@@ -59,34 +61,39 @@ All environment variables use the `SANDBOX_` prefix.
 ## 2. Example Configurations
 
 ### A. Local Development (`.env.local`)
-Zero external dependencies needed (uses local Docker and SQLite fallback):
+Uses local Docker PostgreSQL (started via `scripts/start-local-postgres.sh` or `deploy/docker-compose.yml`):
 ```ini
+ENV=development
 SANDBOX_DRIVER=docker
 SANDBOX_IMAGE=sandbox-base:latest
 SANDBOX_WARM_POOL_SIZE=2
 SANDBOX_DOCKER_RUNTIME=runc
 SANDBOX_ALLOW_RUNTIME_FALLBACK=true
-SANDBOX_REDIS_URL=
-SANDBOX_SQLITE_PATH=.sandbox_ledger.db
+
+# Persistent Data Source (Local Docker Postgres)
+SANDBOX_POSTGRES_URL=postgresql://sandbox:sandbox@localhost:5432/sandbox
+
 SANDBOX_PORT=8080
 SANDBOX_PIDS_LIMIT=256
 SANDBOX_DEFAULT_WORKSPACE_DISK_QUOTA_MB=1024
 ```
 
 ### B. Production Multi-Replica Kubernetes Cluster (`.env.prod`)
-Hardened zero-trust deployment with gVisor, Redis distributed locks, egress firewall, and metrics:
+Hardened zero-trust deployment with PostgreSQL persistence (strictly required in ENV), gVisor, egress firewall, and Prometheus metrics:
 ```ini
+ENV=production
 SANDBOX_DRIVER=k8s
 SANDBOX_IMAGE=my-registry.io/sandbox-base:v1.0.0
 SANDBOX_API_KEY=sk_live_prod_secret_token_77a941
+
+# Persistent Data Source (Strictly required in ENV in production)
+SANDBOX_POSTGRES_URL=postgresql://prod_user:StrongSecretPassword@postgres-ha.sandboxes.svc.cluster.local:5432/sandboxes_prod
 
 # Pool and Concurrency
 SANDBOX_WARM_POOL_SIZE=10
 SANDBOX_MAX_CONCURRENT_SPAWNS=20
 
-# Multi-Replica State
-SANDBOX_REDIS_URL=redis://redis-cluster.sandboxes.svc.cluster.local:6379/0
-SANDBOX_REQUIRE_REDIS=true
+# Multi-Replica State & Leases
 SANDBOX_DEFAULT_SESSION_TTL=600
 SANDBOX_ORPHAN_GRACE_PERIOD_SEC=60.0
 

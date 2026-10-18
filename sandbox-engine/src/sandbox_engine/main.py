@@ -57,6 +57,7 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down sandbox-engine...")
     await sweeper.stop()
     await warm_pool.stop()
+    await lease_mgr.close()
 
 
 app = FastAPI(
@@ -98,14 +99,22 @@ async def healthz():
 
 @app.get("/readyz", tags=["System"])
 async def readyz():
-    """Readiness probe: validates backend container driver and warm pool availability."""
+    """Readiness probe: validates backend container driver, database ledger, and warm pool availability."""
     if not hasattr(app.state, "driver") or not hasattr(app.state, "warm_pool"):
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Engine initializing")
+
+    db_ready = True
+    if hasattr(app.state, "lease_manager") and app.state.lease_manager:
+        db_ready = await app.state.lease_manager.ping()
+
+    if not db_ready:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database ledger unreachable")
 
     # Verify warm pool has ready instances or driver is responsive
     pool_size = app.state.warm_pool.queue.qsize()
     return {
         "status": "ready",
+        "database": "ready",
         "warm_pool_ready": pool_size > 0,
         "warm_pool_size": pool_size,
     }

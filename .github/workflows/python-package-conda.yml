@@ -14,6 +14,21 @@ jobs:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sandbox
+          POSTGRES_PASSWORD: sandbox
+          POSTGRES_DB: sandbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
     - uses: actions/checkout@v4
 
@@ -45,6 +60,7 @@ jobs:
 
     - name: Test with pytest
       shell: bash -el {0}
+      env:
+        SANDBOX_POSTGRES_URL: postgresql://sandbox:sandbox@localhost:5432/sandbox
       run: |
-        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/test_production_hardening.py sandbox-client/tests/test_e2e.py
-
+        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/test_postgres_persistence.py sandbox-engine/tests/test_production_hardening.py sandbox-client/tests/test_e2e.py
