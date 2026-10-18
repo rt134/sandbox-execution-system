@@ -16,13 +16,41 @@ spec:
         app.kubernetes.io/name: sandbox-engine
     spec:
       serviceAccountName: sandbox-engine-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sandbox-engine
       containers:
         - name: engine
-          image: sandbox-engine:latest
+          image: sandbox-engine:v0.1.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8080
               name: http
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: SANDBOX_ENVIRONMENT
               value: "production"
             - name: SANDBOX_DRIVER
@@ -50,6 +78,9 @@ spec:
                 secretKeyRef:
                   name: sandbox-secrets
                   key: postgres-url
+          volumeMounts:
+            - name: tmp-dir
+              mountPath: /tmp
           livenessProbe:
             httpGet:
               path: /healthz
@@ -77,6 +108,9 @@ spec:
             limits:
               cpu: "2.0"
               memory: "2Gi"
+      volumes:
+        - name: tmp-dir
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

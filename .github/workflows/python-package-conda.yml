@@ -58,9 +58,22 @@ jobs:
       run: |
         docker build -t sandbox-base:latest daemon/
 
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+        cache-dependency-path: daemon/go.sum
+
+    - name: Test Go daemon
+      run: |
+        cd daemon
+        go vet ./...
+        go test -v ./handlers
+
     - name: Test with pytest
       shell: bash -el {0}
       env:
         SANDBOX_POSTGRES_URL: postgresql://sandbox:sandbox@localhost:5432/sandbox
       run: |
-        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/test_postgres_persistence.py sandbox-engine/tests/test_production_hardening.py sandbox-client/tests/test_e2e.py
+        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/
+

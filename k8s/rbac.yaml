@@ -2,6 +2,12 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: sandbox-system
+  labels:
+    kubernetes.io/metadata.name: sandbox-system
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
 ---
 apiVersion: v1
 kind: Namespace
@@ -9,6 +15,12 @@ metadata:
   name: sandboxes
   labels:
     kubernetes.io/metadata.name: sandboxes
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
 ---
 apiVersion: v1
 kind: ServiceAccount

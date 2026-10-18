@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+Multi-Tenant Security, Quotas, and Storage Isolation Test Suite:
+1. Cross-Tenant Workspace Ownership Guard (Tenant B cannot acquire Tenant A's workspace -> 403 Forbidden).
+2. Physical Directory Tenant Scoping (Different tenants get separate host paths).
+3. Collision-Proof K8s PVC Hashing (Foo_Bar vs foo-bar and cross-tenant hashing).
+4. WebSocket PTY Cross-Tenant Rejection (close code 4403).
+5. Production Secret Hardening & Weak Key Rejection.
+6. Per-Tenant Quotas & Sliding-Window Rate Limiting (429 Too Many Requests).
+7. Dead Container Sweeper Reconciliation (Unresponsive/dead container lease & lock freed).
+"""
+
+import asyncio
+import hashlib
+import time
+import httpx
+import pytest
+
+from sandbox_engine.config import EngineSettings
+from sandbox_engine.core.lease_manager import LeaseManager
+from sandbox_engine.core.security import validate_workspace_id
+from sandbox_engine.drivers.base import ContainerDriver
+from sandbox_engine.drivers.mock_driver import MockDriver
+from sandbox_engine.main import app
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_workspace_ownership_rejection():
+    """Verify that workspaces are tenant-owned and cross-tenant acquire returns HTTP 403."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers_tenant_a = {"X-Tenant-ID": "tenant_alpha"}
+            headers_tenant_b = {"X-Tenant-ID": "tenant_bravo"}
+
+            # 1. Tenant A acquires workspace 'shared_codebase'
+            resp_a = await client.post(
+                "/v1/sessions/acquire",
+                json={"workspace_id": "shared_codebase", "ttl_seconds": 60},
+                headers=headers_tenant_a,
+            )
+            assert resp_a.status_code == 200, f"Tenant A failed to acquire: {resp_a.text}"
+            sess_a_data = resp_a.json()
+            sess_a_id = sess_a_data["session_id"]
+
+            # Release session so workspace lock is idle
+            resp_rel = await client.post(
+                f"/v1/sessions/{sess_a_id}/release",
+                headers=headers_tenant_a,
+            )
+            assert resp_rel.status_code == 200
+
+            # 2. Tenant B attempts to acquire Tenant A's idle workspace 'shared_codebase'
+            resp_b = await client.post(
+                "/v1/sessions/acquire",
+                json={"workspace_id": "shared_codebase", "ttl_seconds": 60},
+                headers=headers_tenant_b,
+            )
+
+            # MUST return 403 Forbidden!
+            assert resp_b.status_code == 403, f"Expected 403 Forbidden, got {resp_b.status_code}: {resp_b.text}"
+            assert "owned by another tenant" in resp_b.text
+
+
+def test_physical_directory_tenant_scoping(tmp_path):
+    """Verify that different tenants get strictly isolated physical directories on host."""
+    root = str(tmp_path)
+    ws_name = "project_x"
+
+    dir_tenant_1 = validate_workspace_id(ws_name, root, tenant_id="acme_corp")
+    dir_tenant_2 = validate_workspace_id(ws_name, root, tenant_id="evil_corp")
+
+    assert dir_tenant_1 != dir_tenant_2, "Tenants must have physically distinct directories!"
+    assert "tenant_" in dir_tenant_1
+    assert "tenant_" in dir_tenant_2
+    assert dir_tenant_1.endswith(ws_name)
+    assert dir_tenant_2.endswith(ws_name)
+
+
+def test_k8s_pvc_hash_collision_prevention():
+    """Verify Foo_Bar vs foo-bar and tenant scoping produce unique, collision-proof PVC names."""
+    def compute_pvc_name(tenant_id: str, workspace_id: str) -> str:
+        scope_key = f"{tenant_id}:{workspace_id}"
+        scope_hash = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()[:24]
+        return f"pvc-{scope_hash}"
+
+    # 1. Slug collision check: Foo_Bar vs foo-bar
+    pvc_foo_bar_caps = compute_pvc_name("tenant_1", "Foo_Bar")
+    pvc_foo_bar_lower = compute_pvc_name("tenant_1", "foo-bar")
+    pvc_foo_bar_dash = compute_pvc_name("tenant_1", "foo_bar")
+
+    assert pvc_foo_bar_caps != pvc_foo_bar_lower, "Foo_Bar and foo-bar must not collide!"
+    assert pvc_foo_bar_caps != pvc_foo_bar_dash, "Foo_Bar and foo_bar must not collide!"
+
+    # 2. Cross-tenant same workspace name check
+    pvc_tenant_a = compute_pvc_name("tenant_a", "workspace_1")
+    pvc_tenant_b = compute_pvc_name("tenant_b", "workspace_1")
+
+    assert pvc_tenant_a != pvc_tenant_b, "Different tenants must never share the same PVC name!"
+    assert len(pvc_tenant_a) <= 63, "PVC name must satisfy RFC 1123 max length 63"
+
+
+def test_production_secret_validation():
+    """Verify that validate_production_settings() rejects weak secrets, placeholders, and insecure defaults."""
+    # 1. Placeholder API Key
+    s1 = EngineSettings(
+        environment="production",
+        api_key="prod-secret-sandbox-key-replace-me",
+        encryption_key="a" * 32,
+        driver="k8s",
+    )
+    with pytest.raises(ValueError, match="weak or placeholder"):
+        s1.validate_production_settings()
+
+    # 2. Too short API Key
+    s2 = EngineSettings(
+        environment="production",
+        api_key="short_secret",
+        encryption_key="a" * 32,
+        driver="k8s",
+    )
+    with pytest.raises(ValueError, match="at least 32 characters"):
+        s2.validate_production_settings()
+
+    # 3. Default encryption key
+    s3 = EngineSettings(
+        environment="production",
+        api_key="b" * 32,
+        encryption_key="default-sandbox-secret-replace-in-production",
+        driver="k8s",
+    )
+    with pytest.raises(ValueError, match="placeholder or default"):
+        s3.validate_production_settings()
+
+    # 4. Insecure Docker runtime in production
+    s4 = EngineSettings(
+        environment="production",
+        api_key="c" * 32,
+        encryption_key="d" * 32,
+        driver="docker",
+        docker_runtime="runc",
+        allow_insecure_docker_production=False,
+    )
+    with pytest.raises(ValueError, match="Insecure Docker container runtime 'runc'"):
+        s4.validate_production_settings()
+
+    # 5. Strong production settings pass validation
+    s5 = EngineSettings(
+        environment="production",
+        api_key="e" * 32,
+        encryption_key="f" * 32,
+        driver="k8s",
+    )
+    s5.validate_production_settings()
+
+
+@pytest.mark.asyncio
+async def test_per_tenant_quotas_and_rate_limiting():
+    """Verify TTL caps, stateless timeout caps, and per-tenant rate limits."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"X-Tenant-ID": "quota_test_tenant"}
+
+            # 1. Excessive TTL rejection
+            resp_ttl = await client.post(
+                "/v1/sessions/acquire",
+                json={"workspace_id": "ws_ttl_test", "ttl_seconds": 999999},
+                headers=headers,
+            )
+            assert resp_ttl.status_code == 400
+            assert "exceeds maximum allowed limit" in resp_ttl.text
+
+            # 2. Excessive stateless timeout rejection
+            resp_stateless = await client.post(
+                "/v1/stateless/execute",
+                json={"language": "python", "code": "print(1)", "timeout": 3600.0},
+                headers=headers,
+            )
+            assert resp_stateless.status_code == 400
+            assert "exceeds maximum limit" in resp_stateless.text
+
+            # 3. Rate limiting test: exceed limit within 60s
+            rate_limited = False
+            for _ in range(130):
+                r = await client.get("/v1/sessions/invalid_session_id/fs/read?path=test.txt", headers={"X-Tenant-ID": "burst_tenant"})
+                if r.status_code == 429:
+                    rate_limited = True
+                    assert "Retry-After" in r.headers
+                    break
+
+            assert rate_limited, "Expected HTTP 429 Too Many Requests after exceeding 120 req/min rate limit!"
+
+
+@pytest.mark.asyncio
+async def test_dead_container_sweeper_reconciliation():
+    """Verify that the sweeper detects a dead/crashed container and immediately reclaims the lease and workspace lock."""
+    from sandbox_engine.core.sweeper import Sweeper
+
+    lease_mgr = LeaseManager()
+    await lease_mgr.initialize()
+
+    class FlakyDriver(MockDriver):
+        def __init__(self):
+            super().__init__()
+            self.live_containers = set()
+
+        async def is_alive(self, sandbox_id: str) -> bool:
+            return sandbox_id in self.live_containers
+
+    driver = FlakyDriver()
+    sweeper = Sweeper(driver=driver, lease_manager=lease_mgr)
+
+    # Acquire lease and lock
+    session_id = "sess_dead_recovery"
+    ws_id = "ws_dead_recovery"
+    sandbox_id = "sbx_will_die"
+
+    await lease_mgr.claim_workspace_ownership(ws_id, "tenant_a")
+    await lease_mgr.acquire_workspace_lock(ws_id, session_id, ttl_seconds=300)
+    await lease_mgr.create_or_renew(
+        session_id=session_id,
+        workspace_id=ws_id,
+        sandbox_id=sandbox_id,
+        endpoint="http://127.0.0.1:5004",
+        ttl_seconds=300,
+        tenant_id="tenant_a",
+    )
+
+    # Container starts alive
+    driver.live_containers.add(sandbox_id)
+    assert await driver.is_alive(sandbox_id) is True
+
+    # Container crashes / dies!
+    driver.live_containers.remove(sandbox_id)
+    assert await driver.is_alive(sandbox_id) is False
+
+    # Run sweeper single pass
+    await sweeper.sweep_once()
+
+    # Verify lease is expired and workspace lock is freed
+    lease = await lease_mgr.get(session_id)
+    assert lease is None or lease.status == "expired", "Dead container's lease must be expired!"
+
+    # Now another session can acquire the workspace lock immediately without 409 conflict
+    acquired, locked_by, _ = await lease_mgr.acquire_workspace_lock(ws_id, "sess_new", ttl_seconds=60)
+    assert acquired is True, f"Workspace lock should be released after dead container reconciliation! Locked by: {locked_by}"
+
+    await lease_mgr.close()

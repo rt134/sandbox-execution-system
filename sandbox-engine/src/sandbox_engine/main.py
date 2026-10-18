@@ -92,7 +92,7 @@ _rate_limit_lock = asyncio.Lock()
 
 @app.middleware("http")
 async def limit_request_size(request: Request, call_next):
-    """Enforce strict request body size limit (25MB) to prevent memory exhaustion attacks."""
+    """Enforce strict request body size limit (25MB) including chunked streams to prevent memory exhaustion attacks."""
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -104,6 +104,26 @@ async def limit_request_size(request: Request, call_next):
                 )
         except ValueError:
             pass
+    else:
+        # Protect against chunked streaming memory bombs where Content-Length is omitted
+        received_bytes = 0
+        original_receive = request._receive
+
+        async def limited_receive():
+            nonlocal received_bytes
+            msg = await original_receive()
+            if msg.get("type") == "http.request":
+                body_chunk = msg.get("body", b"")
+                received_bytes += len(body_chunk)
+                if received_bytes > settings.max_request_size_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Request entity too large: streaming payload exceeds 25MB limit",
+                    )
+            return msg
+
+        request._receive = limited_receive
+
     return await call_next(request)
 
 

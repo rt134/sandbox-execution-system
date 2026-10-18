@@ -1,0 +1,25 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sandbox-engine-pdb
+  namespace: sandbox-system
+  labels:
+    app.kubernetes.io/name: sandbox-engine
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-engine
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: squid-proxy-pdb
+  namespace: sandbox-system
+  labels:
+    app.kubernetes.io/name: squid-proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: squid-proxy
