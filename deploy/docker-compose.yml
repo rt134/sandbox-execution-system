@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: sandbox-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  squid:
+    build:
+      context: ./squid
+      dockerfile: Dockerfile
+    container_name: sandbox-squid
+    ports:
+      - "3128:3128"
+    restart: unless-stopped
+
+  sandbox-engine:
+    build:
+      context: ../sandbox-engine
+      dockerfile: Dockerfile
+    container_name: sandbox-engine
+    ports:
+      - "8080:8080"
+    environment:
+      - SANDBOX_DRIVER=docker
+      - SANDBOX_REDIS_URL=redis://redis:6379/0
+      - SANDBOX_WARM_POOL_SIZE=2
+      - SANDBOX_HTTP_PROXY=http://squid:3128
+      - SANDBOX_HTTPS_PROXY=http://squid:3128
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - workspaces-data:/workspaces
+    depends_on:
+      - redis
+      - squid
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  workspaces-data:

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sandbox-client"
+version = "0.1.0"
+description = "Lightweight async Python client library for Sandbox Execution System"
+authors = [{ name = "Sandbox Engineering Team" }]
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.24.0",
+    "websockets>=11.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

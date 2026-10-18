@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import time
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from ..core.warm_pool import WarmPoolManager
+from ..models import StatelessRunRequest, StatelessRunResponse
+
+router = APIRouter(prefix="/v1/stateless", tags=["Stateless Execution"])
+
+
+def get_warm_pool(request: Request) -> WarmPoolManager:
+    return request.app.state.warm_pool
+
+
+@router.post("/run", response_model=StatelessRunResponse)
+async def run_stateless_code(
+    payload: StatelessRunRequest,
+    warm_pool: WarmPoolManager = Depends(get_warm_pool),
+) -> StatelessRunResponse:
+    """
+    Execute stateless code with sub-50ms SLA using the pre-warmed container pool.
+    """
+    start_time = time.perf_counter()
+
+    # 1. Grab a pre-warmed sandbox (<1ms)
+    try:
+        instance = await warm_pool.acquire(timeout=5.0)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"No available warm sandbox: {e}")
+
+    try:
+        # 2. Direct HTTP dispatch to shellctl inside container
+        timeout_client = httpx.Timeout(payload.timeout + 2.0, connect=1.0)
+        async with httpx.AsyncClient(timeout=timeout_client) as client:
+            resp = await client.post(
+                f"{instance.endpoint}/execute",
+                json={
+                    "language": payload.language,
+                    "code": payload.code,
+                    "inputs": payload.inputs,
+                    "timeout": payload.timeout,
+                },
+            )
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail=f"In-sandbox daemon returned {resp.status_code}: {resp.text}",
+            )
+
+        data = resp.json()
+        total_duration_ms = (time.perf_counter() - start_time) * 1000
+
+        return StatelessRunResponse(
+            output=data.get("output"),
+            logs=data.get("logs", ""),
+            error=data.get("error"),
+            exit_code=data.get("exit_code", 0),
+            duration_ms=total_duration_ms,
+            sandbox_id=instance.sandbox_id,
+        )
+
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Communication error with sandbox: {e}")
+    finally:
+        # 3. Recycle consumed container asynchronously (never blocks caller response)
+        warm_pool.trigger_recycle(instance)
