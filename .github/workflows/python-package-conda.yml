@@ -1,0 +1,45 @@
+name: Python Package using Conda
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 5
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }} with Conda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        auto-update-conda: true
+        python-version: ${{ matrix.python-version }}
+        activate-environment: test-env
+
+    - name: Install dependencies
+      shell: bash -el {0}
+      run: |
+        conda install -y pytest flake8
+        pip install -e ./sandbox-client
+        pip install -e ./sandbox-engine
+
+    - name: Lint with flake8
+      shell: bash -el {0}
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=daemon/
+        # exit-zero treats all errors as warnings
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=daemon/
+
+    - name: Test with pytest
+      shell: bash -el {0}
+      run: |
+        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/test_drivers.py sandbox-client/tests/test_client_models.py
