@@ -239,7 +239,7 @@ async def proxy_exec(
     cmd_summary = str(raw_cmd)[:500]
     await lease_mgr.log_audit_event(
         session_id=session_id,
-        event="command_exec",
+        event_type="command_exec",
         details={
             "command": cmd_summary,
             "stream": body.get("stream", False),
@@ -295,7 +295,7 @@ async def proxy_fs_write(
     # Audit log file write
     await lease_mgr.log_audit_event(
         session_id=session_id,
-        event="file_write",
+        event_type="file_write",
         details={"path": body.get("path", ""), "tenant_id": tenant_id},
     )
 
@@ -348,7 +348,7 @@ async def proxy_fs_delete(
     # Audit log file delete
     await lease_mgr.log_audit_event(
         session_id=session_id,
-        event="file_delete",
+        event_type="file_delete",
         details={"path": body.get("path", ""), "tenant_id": tenant_id},
     )
 
