@@ -21,9 +21,10 @@ class WarmPoolManager:
     Implements a 'replenish-on-consume' pattern with bounded concurrency semaphore.
     """
 
-    def __init__(self, driver: ContainerDriver, target_size: Optional[int] = None):
+    def __init__(self, driver: ContainerDriver, target_size: Optional[int] = None, engine_id: Optional[str] = None):
         self.driver = driver
         self.target_size = target_size if target_size is not None else settings.warm_pool_size
+        self.engine_id = engine_id or settings.engine_instance_id
         self.queue: asyncio.Queue[SandboxInstance] = asyncio.Queue()
         self._active_spawns: int = 0
         self._running: bool = False
@@ -38,7 +39,7 @@ class WarmPoolManager:
     async def start(self):
         """Initialize the warm pool up to target size."""
         self._running = True
-        logger.info(f"Starting Warm Pool with target size {self.target_size} using {settings.driver} driver...")
+        logger.info(f"Starting Warm Pool (replica '{self.engine_id}') with target size {self.target_size} using {settings.driver} driver...")
         spawn_tasks = [self._spawn_warm_instance() for _ in range(self.target_size)]
         await asyncio.gather(*spawn_tasks, return_exceptions=True)
         WARM_POOL_AVAILABLE.set(self.queue.qsize())
