@@ -627,6 +627,8 @@ class PostgresLeaseBackend(LeaseBackend):
                 INSERT INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id)
                 VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
                 ON CONFLICT (session_id) DO UPDATE SET
+                    sandbox_id = EXCLUDED.sandbox_id,
+                    workspace_id = EXCLUDED.workspace_id,
                     expires_at = EXCLUDED.expires_at,
                     status = 'active',
                     endpoint = EXCLUDED.endpoint,
