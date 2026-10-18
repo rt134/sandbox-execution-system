@@ -6,6 +6,19 @@ The `sandbox-engine` control plane exposes a unified HTTP and WebSocket interfac
 
 ---
 
+## 0. Authentication & Security
+
+When `SANDBOX_API_KEY` is configured on the engine, all REST endpoints and WebSocket handshakes require authentication.
+
+### Supported Authentication Methods:
+* **HTTP Bearer Token:** `Authorization: Bearer <your-api-key>`
+* **HTTP Custom Header:** `X-API-Key: <your-api-key>`
+* **WebSocket Query Parameter:** `ws://host:8080/v1/sessions/{id}/ws/pty?token=<your-api-key>`
+
+Unauthenticated requests receive `401 Unauthorized` with `{"detail": "Missing or invalid API key"}`. All token comparisons are executed using constant-time algorithms to prevent timing attacks.
+
+---
+
 ## 1. Stateless Code Execution
 
 ### `POST /v1/stateless/run`
@@ -92,6 +105,16 @@ Creates a new stateful session or reattaches to an existing active session. Moun
 }
 ```
 
+#### Error Responses:
+* **`400 Bad Request`**: `workspace_id` failed validation or attempted path traversal.
+  ```json
+  {"detail": "Invalid workspace_id: must match ^[a-zA-Z0-9_-]{1,64}$"}
+  ```
+* **`409 Conflict`**: Workspace concurrency lock conflict. The workspace is actively locked by another session.
+  ```json
+  {"detail": "Workspace 'repo_482' is currently locked by active session 'sess_other_999'"}
+  ```
+
 ---
 
 ### `POST /v1/sessions/{session_id}/heartbeat`
@@ -172,7 +195,7 @@ Emits NDJSON chunks line-by-line as output arrives:
 ---
 
 ### `POST /v1/sessions/{session_id}/fs/write`
-Creates or overwrites a file in the workspace.
+Creates or overwrites a file in the workspace. Validates that the write will not exceed the workspace disk quota.
 
 #### Request Body:
 ```json
@@ -180,6 +203,38 @@ Creates or overwrites a file in the workspace.
   "path": "calculator/main.py",
   "content": "def add(a, b): return a + b\n",
   "is_base64": false
+}
+```
+
+#### Response (`200 OK`):
+```json
+{
+  "path": "calculator/main.py",
+  "bytes_written": 32
+}
+```
+
+#### Error Response:
+* **`413 Payload Too Large`**: Workspace disk quota exceeded.
+  ```json
+  {"detail": "Disk quota exceeded: write would cause workspace to exceed 1024MB limit"}
+  ```
+
+---
+
+### `GET /v1/sessions/{session_id}/fs/quota`
+Inspects workspace disk storage consumption against the configured disk quota.
+
+#### Response (`200 OK`):
+```json
+{
+  "used_bytes": 1048576,
+  "used_mb": 1.0,
+  "quota_bytes": 1073741824,
+  "quota_mb": 1024.0,
+  "available_bytes": 1072693248,
+  "available_mb": 1023.0,
+  "usage_percent": 0.1
 }
 ```
 
@@ -251,10 +306,10 @@ Provides an interactive POSIX pseudo-terminal (`/dev/pts`) session connected dir
 
 ---
 
-## 5. System Health & Telemetry
+## 5. System Health, Probes & Observability
 
 ### `GET /healthz`
-Returns health status, active driver, and warm pool availability.
+Liveness probe returning engine process status, active driver, and pool availability.
 
 #### Response (`200 OK`):
 ```json
@@ -265,4 +320,65 @@ Returns health status, active driver, and warm pool availability.
   "warm_pool_available": 2,
   "active_leases": 1
 }
+```
+
+---
+
+### `GET /readyz`
+Kubernetes readiness probe verifying that the container driver daemon and the persistence ledger (Redis or SQLite) are responsive and accepting traffic.
+
+#### Success Response (`200 OK`):
+```json
+{
+  "status": "ready",
+  "driver": "ready",
+  "ledger": "ready"
+}
+```
+
+#### Degraded Response (`503 Service Unavailable`):
+```json
+{
+  "status": "not_ready",
+  "driver": "driver unreachable: Connection refused",
+  "ledger": "ready"
+}
+```
+
+---
+
+### `GET /metrics`
+Prometheus metrics exporter endpoint. Scraped by Prometheus or OpenTelemetry collectors.
+
+#### Response (`200 OK` - `text/plain`):
+```prometheus
+# HELP sandbox_warm_pool_available Number of warm containers currently ready
+# TYPE sandbox_warm_pool_available gauge
+sandbox_warm_pool_available 2.0
+
+# HELP sandbox_warm_pool_target Target warm pool size
+# TYPE sandbox_warm_pool_target gauge
+sandbox_warm_pool_target 2.0
+
+# HELP sandbox_active_leases Number of active session leases
+# TYPE sandbox_active_leases gauge
+sandbox_active_leases 1.0
+
+# HELP sandbox_active_workspace_locks Number of active workspace concurrency locks held
+# TYPE sandbox_active_workspace_locks gauge
+sandbox_active_workspace_locks 1.0
+
+# HELP sandbox_commands_executed_total Total commands executed in sandboxes
+# TYPE sandbox_commands_executed_total counter
+sandbox_commands_executed_total{status="success"} 42.0
+
+# HELP sandbox_command_duration_seconds Execution latency in seconds
+# TYPE sandbox_command_duration_seconds histogram
+sandbox_command_duration_seconds_bucket{le="0.1"} 38.0
+sandbox_command_duration_seconds_bucket{le="1.0"} 41.0
+sandbox_command_duration_seconds_bucket{le="+Inf"} 42.0
+
+# HELP sandbox_sweeper_reclaims_total Total expired or orphaned containers reclaimed by sweeper
+# TYPE sandbox_sweeper_reclaims_total counter
+sandbox_sweeper_reclaims_total{reason="expired_lease"} 3.0
 ```
