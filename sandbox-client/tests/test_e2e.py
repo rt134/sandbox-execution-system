@@ -29,7 +29,7 @@ async def test_e2e_full_workflow():
             client._http = httpx.AsyncClient(transport=transport, base_url="http://test", timeout=30.0)
 
             # ==========================================
-            # 1. Stateless Code Execution (for DAG Nodes)
+            # 1. Stateless Code Execution
             # ==========================================
             print("\n1. Testing Stateless Code Execution (run_code)...")
             code_snippet = """

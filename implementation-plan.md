@@ -16,7 +16,7 @@ This document outlines the detailed engineering roadmap for developing the **San
 │          • Testable by: TTL expiry test, workspace persistence & SSRF blocks │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Phase 4: sandbox-client Python SDK & End-to-End Suite                        │
-│          • Testable by: Pytest suite verifying DAG nodes & Pydantic AI tools │
+│          • Testable by: Pytest suite verifying stateless & stateful workflows│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -153,7 +153,7 @@ Implement persistent agent sessions with workspace volume mounting, sliding-wind
 ## Phase 4: `sandbox-client` Python SDK & End-to-End Test Suite
 
 ### 4.1 Objective
-Package a clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) that can be installed (`pip install -e sandbox-client`) and used by DAG nodes and Autonomous Agents.
+Package a clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) that can be installed (`pip install -e sandbox-client`) and used by any application or autonomous agent.
 
 ### 4.2 Deliverables
 1. **`sandbox-client/`:**
@@ -162,7 +162,7 @@ Package a clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) th
    * `fs.py`: File operations client (`write`, `read`, `list`, `delete`).
    * `terminal.py`: Interactive PTY WebSocket connection (`send`, `resize`, `recv`).
    * `models.py`: Strongly-typed Pydantic models (`CodeResult`, `ExecChunk`).
-   * `adapters/`: Prebuilt Pydantic AI tool functions (`run_bash`, `read_file`, `write_file`) and DAG node runner adapter.
+   * `adapters/`: Prebuilt agent tool functions (`run_bash`, `read_file`, `write_file`).
 2. **`tests/e2e/`:**
    * Full end-to-end integration test suite.
 
@@ -171,7 +171,7 @@ Package a clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) th
   ```bash
   pytest sandbox-client/tests/
   ```
-* **Test 4.2 (Stateless DAG Node Flow):**
+* **Test 4.2 (Stateless Code Execution Flow):**
   ```python
   result = await client.run_code(
       language="python",

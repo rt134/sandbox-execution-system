@@ -6,7 +6,7 @@ The **Sandbox Execution System** is a high-performance, security-hardened dual-m
 
 It provides a unified, decoupled architecture with two primary artifacts:
 1. **`sandbox-engine` (The Service / Daemon):** A high-throughput orchestration engine managing container lifecycles, pre-warmed execution pools, session leases, security proxies, and background garbage collection.
-2. **`sandbox-client` (The Library / SDK):** A clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) that can be imported by any workflow engine (e.g., DAG code nodes) and autonomous agent frameworks (e.g., Pydantic AI).
+2. **`sandbox-client` (The Library / SDK):** A clean, lightweight asynchronous Python SDK (`httpx` + `websockets`) that can be imported by any application, agent framework, or microservice.
 
 The system features a **Pluggable Driver Architecture** that runs identically across **Docker** (local development and single-node servers) and **Kubernetes** (cloud-native production clusters) via a single environment variable toggle: `SANDBOX_DRIVER=docker` or `SANDBOX_DRIVER=k8s`.
 
@@ -16,9 +16,8 @@ The system features a **Pluggable Driver Architecture** that runs identically ac
 
 ```mermaid
 flowchart TD
-    subgraph CallerApps["Caller Applications (Any Framework)"]
-        DAG["DAG Engine (Stateless Code Nodes)"] -->|Import| Client["sandbox-client (Python SDK)"]
-        Agent["Autonomous Agent (Pydantic AI / Custom)"] -->|Import| Client
+    subgraph CallerApps["Caller Applications"]
+        App["AI Agents / Code Interpreters / Microservices"] -->|Import| Client["sandbox-client (Python SDK)"]
     end
 
     Client -->|HTTP / WebSocket| Service["sandbox-engine Service"]
@@ -77,8 +76,8 @@ flowchart TD
 
 ## 3. Dual Execution Paradigms
 
-### Mode 1: Stateless Code Runner (For DAG Workflow Nodes)
-* **Goal:** Sub-50ms execution latency for pure computation tasks.
+### Mode 1: Stateless Code Runner (Code Interpreter / Function Calls)
+* **Goal:** Sub-50ms execution latency for pure computation, code evaluation, and tool calling tasks.
 * **Execution Flow:**
   1. `sandbox-engine` maintains a pre-warmed pool of idle sandboxes in memory.
   2. When a `run_code()` request arrives, a warm container/pod is popped instantly.
@@ -192,7 +191,7 @@ from sandbox_client import SandboxClient
 client = SandboxClient(base_url="http://sandbox-engine:8080")
 
 # ==========================================
-# 1. Stateless Code Execution (DAG Nodes)
+# 1. Stateless Code Execution
 # ==========================================
 result = await client.run_code(
     language="python",

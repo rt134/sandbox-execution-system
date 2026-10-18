@@ -1,6 +1,6 @@
 # Sandbox Execution System
 
-A high-performance, security-hardened dual-mode execution platform for **stateless DAG workflow code nodes (<50ms execution)** and **stateful autonomous coding agents (persistent workspaces, streaming exec, and interactive PTY)**.
+A high-performance, security-hardened execution platform for **stateless code execution (<50ms latency)** and **stateful AI agent sandboxes (persistent workspaces, real-time streaming exec, and interactive PTY terminals)**.
 
 Designed with a **Pluggable Driver Architecture** supporting both **Docker** (local dev & single VMs) and **Kubernetes** (cloud-native production clusters) via a single environment variable:
 ```bash
@@ -14,8 +14,7 @@ export SANDBOX_DRIVER=docker  # or 'k8s'
 ```mermaid
 flowchart TD
     subgraph ClientLayer["Caller Applications"]
-        DAG["DAG Engine (Code Node)"] -->|Import| SDK["sandbox-client (Python SDK)"]
-        Agent["Autonomous Agent (Pydantic AI)"] -->|Import| SDK
+        App["AI Agents / Code Interpreters / Microservices"] -->|Import| SDK["sandbox-client (Python SDK)"]
     end
 
     SDK -->|HTTP / WebSockets| Engine["sandbox-engine Service (:8080)"]
@@ -115,7 +114,7 @@ pip install -e sandbox-client
 
 ### Python SDK Usage Examples
 
-#### Example 1: Stateless Code Execution (for DAG Workflow Nodes)
+#### Example 1: Stateless Code Execution (Code Interpreter / Function Calls)
 Runs against pre-warmed containers with **`< 50ms` execution latency**:
 ```python
 from sandbox_client import SandboxClient

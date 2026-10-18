@@ -27,7 +27,7 @@ class SandboxClient:
     ) -> CodeResult:
         """
         Execute stateless code with sub-50ms latency using the engine's warm pool.
-        Ideal for workflow DAG code execution nodes.
+        Ideal for code execution, code interpreters, and tool calls.
         """
         resp = await self._http.post(
             "/v1/stateless/run",
