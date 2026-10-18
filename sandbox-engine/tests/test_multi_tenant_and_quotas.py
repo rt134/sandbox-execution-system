@@ -20,8 +20,31 @@ from sandbox_engine.config import EngineSettings
 from sandbox_engine.core.lease_manager import LeaseManager
 from sandbox_engine.core.security import validate_workspace_id
 from sandbox_engine.drivers.base import ContainerDriver
-from sandbox_engine.drivers.mock_driver import MockDriver
 from sandbox_engine.main import app
+
+
+class MockDriver(ContainerDriver):
+    def __init__(self):
+        self.live_containers = set()
+
+    async def create_sandbox(self, spec):
+        return None
+
+    async def destroy_sandbox(self, sandbox_id: str) -> None:
+        self.live_containers.discard(sandbox_id)
+
+    async def get_sandbox_endpoint(self, sandbox_id: str) -> str:
+        return "http://127.0.0.1:5004"
+
+    async def list_sandboxes(self, labels=None):
+        return []
+
+    async def healthcheck(self, endpoint: str, auth_token=None) -> bool:
+        return True
+
+    async def is_alive(self, sandbox_id: str) -> bool:
+        return sandbox_id in self.live_containers
+
 
 
 @pytest.mark.asyncio
@@ -109,7 +132,7 @@ def test_production_secret_validation():
         encryption_key="a" * 32,
         driver="k8s",
     )
-    with pytest.raises(ValueError, match="weak or placeholder"):
+    with pytest.raises(ValueError, match="placeholder"):
         s1.validate_production_settings()
 
     # 2. Too short API Key
@@ -129,7 +152,7 @@ def test_production_secret_validation():
         encryption_key="default-sandbox-secret-replace-in-production",
         driver="k8s",
     )
-    with pytest.raises(ValueError, match="placeholder or default"):
+    with pytest.raises(ValueError, match="placeholder"):
         s3.validate_production_settings()
 
     # 4. Insecure Docker runtime in production
@@ -137,11 +160,12 @@ def test_production_secret_validation():
         environment="production",
         api_key="c" * 32,
         encryption_key="d" * 32,
+        postgres_url="postgresql://sandbox:sandbox@localhost:5432/sandbox",
         driver="docker",
         docker_runtime="runc",
         allow_insecure_docker_production=False,
     )
-    with pytest.raises(ValueError, match="Insecure Docker container runtime 'runc'"):
+    with pytest.raises(ValueError, match="without strong isolation"):
         s4.validate_production_settings()
 
     # 5. Strong production settings pass validation
@@ -149,6 +173,7 @@ def test_production_secret_validation():
         environment="production",
         api_key="e" * 32,
         encryption_key="f" * 32,
+        postgres_url="postgresql://sandbox:sandbox@localhost:5432/sandbox",
         driver="k8s",
     )
     s5.validate_production_settings()
@@ -173,12 +198,12 @@ async def test_per_tenant_quotas_and_rate_limiting():
 
             # 2. Excessive stateless timeout rejection
             resp_stateless = await client.post(
-                "/v1/stateless/execute",
+                "/v1/stateless/run",
                 json={"language": "python", "code": "print(1)", "timeout": 3600.0},
                 headers=headers,
             )
             assert resp_stateless.status_code == 400
-            assert "exceeds maximum limit" in resp_stateless.text
+            assert "exceeds maximum allowed limit" in resp_stateless.text
 
             # 3. Rate limiting test: exceed limit within 60s
             rate_limited = False
@@ -247,3 +272,30 @@ async def test_dead_container_sweeper_reconciliation():
     assert acquired is True, f"Workspace lock should be released after dead container reconciliation! Locked by: {locked_by}"
 
     await lease_mgr.close()
+
+
+def test_websocket_cross_tenant_rejection():
+    """Verify that WebSocket PTY route rejects connections from another tenant with code 4403."""
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    with TestClient(app) as test_client:
+        # 1. Acquire session for tenant_owner
+        resp = test_client.post(
+            "/v1/sessions/acquire",
+            json={"workspace_id": "ws_for_websocket_sec", "ttl_seconds": 60},
+            headers={"X-Tenant-ID": "tenant_owner"},
+        )
+        assert resp.status_code == 200
+        sess_data = resp.json()
+        session_id = sess_data["session_id"]
+
+        # 2. Attempt to connect to WebSocket as tenant_intruder -> MUST be rejected with code 4403
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with test_client.websocket_connect(
+                f"/v1/sessions/{session_id}/ws/pty",
+                headers={"X-Tenant-ID": "tenant_intruder"},
+            ):
+                pass
+        assert excinfo.value.code == 4403, f"Expected WS close code 4403, got {excinfo.value.code}"
+

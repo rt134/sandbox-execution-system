@@ -96,7 +96,19 @@ class EngineSettings(BaseSettings):
                 raise ValueError(
                     f"Production SANDBOX_API_KEY is too short ({len(self.api_key)} chars). Must be at least 32 characters."
                 )
-            weak_patterns = ["change-in-prod", "replace-me", "default-secret", "secret-key", "sandbox-default", "12345", "password", "admin"]
+            weak_patterns = [
+                "change-in-prod",
+                "replace-me",
+                "replace-in-prod",
+                "default-secret",
+                "secret-key",
+                "sandbox-default",
+                "default-sandbox",
+                "sandbox-secret",
+                "12345",
+                "password",
+                "admin",
+            ]
             for wp in weak_patterns:
                 if wp in self.api_key.lower():
                     raise ValueError(
