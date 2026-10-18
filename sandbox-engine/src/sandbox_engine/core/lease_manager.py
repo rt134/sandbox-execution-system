@@ -559,10 +559,13 @@ class PostgresLeaseBackend(LeaseBackend):
                     created_at DOUBLE PRECISION NOT NULL,
                     expires_at DOUBLE PRECISION NOT NULL,
                     status VARCHAR(32) NOT NULL DEFAULT 'active',
-                    auth_token TEXT
+                    auth_token TEXT,
+                    tenant_id VARCHAR(128) DEFAULT 'default'
                 );
+                ALTER TABLE leases ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(128) DEFAULT 'default';
                 CREATE INDEX IF NOT EXISTS idx_leases_workspace_id ON leases(workspace_id);
                 CREATE INDEX IF NOT EXISTS idx_leases_status_expires ON leases(status, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_leases_tenant_id ON leases(tenant_id);
 
                 CREATE TABLE IF NOT EXISTS workspace_locks (
                     workspace_id VARCHAR(128) PRIMARY KEY,
@@ -607,20 +610,23 @@ class PostgresLeaseBackend(LeaseBackend):
         endpoint: str,
         ttl_seconds: int,
         auth_token: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> LeaseRecord:
         now = time.time()
         expires_at = now + ttl_seconds
+        encrypted_token = encrypt_token(auth_token)
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token)
-                VALUES ($1, $2, $3, $4, $5, $6, 'active', $7)
+                INSERT INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id)
+                VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8)
                 ON CONFLICT (session_id) DO UPDATE SET
                     expires_at = EXCLUDED.expires_at,
                     status = 'active',
                     endpoint = EXCLUDED.endpoint,
-                    auth_token = COALESCE(EXCLUDED.auth_token, leases.auth_token)
-                RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token
+                    auth_token = COALESCE(EXCLUDED.auth_token, leases.auth_token),
+                    tenant_id = EXCLUDED.tenant_id
+                RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id
                 """,
                 session_id,
                 workspace_id,
@@ -628,13 +634,14 @@ class PostgresLeaseBackend(LeaseBackend):
                 endpoint,
                 now,
                 expires_at,
-                auth_token,
+                encrypted_token,
+                tenant_id,
             )
             await conn.execute(
                 "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES ($1, $2, 'lease_created', $3, $4)",
                 session_id,
                 workspace_id,
-                json.dumps({"sandbox_id": sandbox_id, "endpoint": endpoint, "ttl": ttl_seconds}),
+                json.dumps({"sandbox_id": sandbox_id, "endpoint": endpoint, "ttl": ttl_seconds, "tenant_id": tenant_id}),
                 now,
             )
             return LeaseRecord(
@@ -645,7 +652,8 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=row["auth_token"],
+                auth_token=decrypt_token(row["auth_token"]),
+                tenant_id=row.get("tenant_id") or "default",
             )
 
     async def heartbeat(self, session_id: str, ttl_seconds: int) -> Optional[LeaseRecord]:
@@ -657,7 +665,7 @@ class PostgresLeaseBackend(LeaseBackend):
                 UPDATE leases
                 SET expires_at = $2, status = 'active'
                 WHERE session_id = $1 AND status = 'active'
-                RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token
+                RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id
                 """,
                 session_id,
                 expires_at,
@@ -672,13 +680,14 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=row["auth_token"],
+                auth_token=decrypt_token(row["auth_token"]),
+                tenant_id=row.get("tenant_id") or "default",
             )
 
     async def get_lease(self, session_id: str) -> Optional[LeaseRecord]:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE session_id = $1",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE session_id = $1",
                 session_id,
             )
             if not row:
@@ -691,7 +700,8 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=row["auth_token"],
+                auth_token=decrypt_token(row["auth_token"]),
+                tenant_id=row.get("tenant_id") or "default",
             )
 
     async def release_lease(self, session_id: str) -> bool:
@@ -714,10 +724,19 @@ class PostgresLeaseBackend(LeaseBackend):
 
     async def get_expired_leases(self) -> List[LeaseRecord]:
         now = time.time()
+        return await self.claim_expired_leases(now)
+
+    async def claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
+        """Atomically transitions active expired leases to 'reclaiming' to eliminate heartbeat race conditions."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at < $1",
-                now,
+                """
+                UPDATE leases
+                SET status = 'reclaiming'
+                WHERE status = 'active' AND expires_at < $1
+                RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id
+                """,
+                cutoff_time,
             )
             return [
                 LeaseRecord(
@@ -728,7 +747,8 @@ class PostgresLeaseBackend(LeaseBackend):
                     created_at=r["created_at"],
                     expires_at=r["expires_at"],
                     status=r["status"],
-                    auth_token=r["auth_token"],
+                    auth_token=decrypt_token(r["auth_token"]),
+                    tenant_id=r.get("tenant_id") or "default",
                 )
                 for r in rows
             ]
@@ -750,7 +770,7 @@ class PostgresLeaseBackend(LeaseBackend):
         now = time.time()
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at >= $1",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at >= $1",
                 now,
             )
             return [
@@ -762,10 +782,23 @@ class PostgresLeaseBackend(LeaseBackend):
                     created_at=r["created_at"],
                     expires_at=r["expires_at"],
                     status=r["status"],
-                    auth_token=r["auth_token"],
+                    auth_token=decrypt_token(r["auth_token"]),
+                    tenant_id=r.get("tenant_id") or "default",
                 )
                 for r in rows
             ]
+
+    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
+        now = time.time()
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES ($1, $2, $3, $4, $5)",
+                session_id,
+                workspace_id,
+                event_type,
+                json.dumps(details),
+                now,
+            )
 
     async def acquire_workspace_lock(
         self, workspace_id: str, session_id: str, ttl_seconds: int
@@ -926,10 +959,12 @@ class LeaseManager:
         endpoint: str,
         ttl_seconds: Optional[int] = None,
         auth_token: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> LeaseRecord:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
-        return await self._backend.create_or_renew_lease(session_id, workspace_id, sandbox_id, endpoint, ttl, auth_token=auth_token)
-
+        return await self._backend.create_or_renew_lease(
+            session_id, workspace_id, sandbox_id, endpoint, ttl, auth_token=auth_token, tenant_id=tenant_id
+        )
 
     async def heartbeat(self, session_id: str, ttl_seconds: Optional[int] = None) -> Optional[LeaseRecord]:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
@@ -943,6 +978,16 @@ class LeaseManager:
 
     async def get_expired(self) -> List[LeaseRecord]:
         return await self._backend.get_expired_leases()
+
+    async def claim_expired(self, cutoff_time: Optional[float] = None) -> List[LeaseRecord]:
+        now = cutoff_time if cutoff_time is not None else time.time()
+        if hasattr(self._backend, "claim_expired_leases"):
+            return await self._backend.claim_expired_leases(now)
+        return await self._backend.get_expired_leases()
+
+    async def log_audit_event(self, session_id: str, workspace_id: str, event_type: str, details: dict):
+        if hasattr(self._backend, "log_audit_event"):
+            await self._backend.log_audit_event(session_id, workspace_id, event_type, details)
 
     async def mark_expired(self, session_id: str) -> None:
         await self._backend.mark_expired(session_id)

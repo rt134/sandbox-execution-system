@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .api.routes_sessions import router as sessions_router
@@ -13,6 +12,7 @@ from .api.routes_ws import router as ws_router
 from .config import settings
 from .core.lease_manager import LeaseManager
 from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
+from .core.security import verify_api_key
 from .core.sweeper import Sweeper
 from .core.warm_pool import WarmPoolManager
 from .drivers import get_driver
@@ -26,6 +26,9 @@ logger = logging.getLogger("sandbox.engine")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Enforce strict fail-fast validation in production mode
+    settings.validate_production_settings()
+
     logger.info(f"🚀 Initializing sandbox-engine with driver: {settings.driver}")
     driver = get_driver()
 
@@ -77,12 +80,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    """Enforce strict request body size limit (25MB) to prevent memory exhaustion attacks."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > settings.max_request_size_bytes:
+                return Response(
+                    content='{"detail": "Request entity too large: payload exceeds 25MB limit"}',
+                    status_code=413,
+                    media_type="application/json",
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
+
+
 app.include_router(stateless_router)
 app.include_router(sessions_router)
 app.include_router(ws_router)
 
 
-@app.get("/healthz", tags=["System"])
+@app.get("/healthz", tags=["System"], dependencies=[Depends(verify_api_key)])
 async def healthz():
     """Liveness probe: returns 200 if server process is running."""
     driver_name = getattr(app.state, "driver", None).__class__.__name__ if hasattr(app.state, "driver") else "unknown"
@@ -97,7 +118,7 @@ async def healthz():
     }
 
 
-@app.get("/readyz", tags=["System"])
+@app.get("/readyz", tags=["System"], dependencies=[Depends(verify_api_key)])
 async def readyz():
     """Readiness probe: validates backend container driver, database ledger, and warm pool availability."""
     if not hasattr(app.state, "driver") or not hasattr(app.state, "warm_pool"):
@@ -120,7 +141,7 @@ async def readyz():
     }
 
 
-@app.get("/metrics", tags=["Observability"])
+@app.get("/metrics", tags=["Observability"], dependencies=[Depends(verify_api_key)])
 async def get_metrics():
     """Prometheus metrics endpoint for scraping."""
     if hasattr(app.state, "warm_pool") and app.state.warm_pool:

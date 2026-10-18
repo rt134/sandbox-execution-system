@@ -12,6 +12,9 @@ from ..models import StatelessRunRequest, StatelessRunResponse
 router = APIRouter(prefix="/v1/stateless", tags=["Stateless Execution"])
 
 
+ALLOWED_LANGUAGES = {"python", "javascript", "typescript", "bash", "sh", "go", "rust", "node"}
+
+
 def get_warm_pool(request: Request) -> WarmPoolManager:
     return request.app.state.warm_pool
 
@@ -27,11 +30,15 @@ async def run_stateless_code(
     start_time = time.perf_counter()
     status = "error"
 
+    # Normalize language Prometheus label to prevent unbounded metric cardinality
+    raw_lang = (payload.language or "").lower().strip()
+    metric_lang = raw_lang if raw_lang in ALLOWED_LANGUAGES else "other"
+
     # 1. Grab a pre-warmed sandbox (<1ms)
     try:
         instance = await warm_pool.acquire(timeout=5.0)
     except Exception as e:
-        STATELESS_RUNS_TOTAL.labels(language=payload.language, status="pool_exhausted").inc()
+        STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="pool_exhausted").inc()
         raise HTTPException(status_code=503, detail=f"No available warm sandbox: {e}")
 
     try:
@@ -52,7 +59,6 @@ async def run_stateless_code(
                 },
             )
 
-
         if resp.status_code != 200:
             status = "failed"
             raise HTTPException(
@@ -67,8 +73,8 @@ async def run_stateless_code(
         exit_code = data.get("exit_code", 0)
         status = "success" if exit_code == 0 else "error"
 
-        STATELESS_RUNS_TOTAL.labels(language=payload.language, status=status).inc()
-        STATELESS_DURATION_SECONDS.labels(language=payload.language).observe(duration_sec)
+        STATELESS_RUNS_TOTAL.labels(language=metric_lang, status=status).inc()
+        STATELESS_DURATION_SECONDS.labels(language=metric_lang).observe(duration_sec)
 
         return StatelessRunResponse(
             output=data.get("output"),
@@ -81,11 +87,11 @@ async def run_stateless_code(
 
     except httpx.TimeoutException:
         status = "timeout"
-        STATELESS_RUNS_TOTAL.labels(language=payload.language, status="timeout").inc()
+        STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="timeout").inc()
         raise HTTPException(status_code=504, detail="Execution timed out in sandbox")
     except httpx.RequestError as e:
         status = "comm_error"
-        STATELESS_RUNS_TOTAL.labels(language=payload.language, status="comm_error").inc()
+        STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="comm_error").inc()
         raise HTTPException(status_code=502, detail=f"Communication error with sandbox: {e}")
     finally:
         # 3. Recycle consumed container asynchronously (never blocks caller response)

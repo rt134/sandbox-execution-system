@@ -39,6 +39,7 @@ def get_lease_manager(request: Request) -> LeaseManager:
 @router.post("/acquire", response_model=SessionAcquireResponse)
 async def acquire_session(
     payload: SessionAcquireRequest,
+    request: Request,
     driver: ContainerDriver = Depends(get_driver),
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ) -> SessionAcquireResponse:
@@ -73,9 +74,12 @@ async def acquire_session(
         )
 
     try:
+        tenant_id = getattr(request.state, "tenant_id", "default")
         # Check for existing active lease to reattach
         existing = await lease_mgr.get(session_id)
         if existing and existing.status == "active":
+            if existing.tenant_id and existing.tenant_id != tenant_id:
+                raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
             # Check if container is still responsive
             if await driver.healthcheck(existing.endpoint, auth_token=existing.auth_token):
                 await lease_mgr.heartbeat(session_id, ttl)
@@ -98,7 +102,7 @@ async def acquire_session(
             sandbox_type="stateful",
             image=settings.image,
             workspace_path=workspace_dir,
-            labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id},
+            labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id, "sandbox.tenant_id": tenant_id},
             pids_limit=getattr(payload, "pids_limit", None) or settings.pids_limit,
             disk_quota_mb=getattr(payload, "disk_quota_mb", None) or settings.default_workspace_disk_quota_mb,
             auth_token=auth_token,
@@ -117,8 +121,8 @@ async def acquire_session(
             endpoint=instance.endpoint,
             ttl_seconds=ttl,
             auth_token=auth_token,
+            tenant_id=tenant_id,
         )
-
 
         # Update metrics
         active_leases = await lease_mgr.list_active()
@@ -145,10 +149,18 @@ async def acquire_session(
 @router.post("/{session_id}/heartbeat", response_model=HeartbeatResponse)
 async def session_heartbeat(
     session_id: str,
+    request: Request,
     payload: HeartbeatRequest = None,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ) -> HeartbeatResponse:
     """Send sliding heartbeat to keep the session alive and refresh workspace lock."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    existing = await lease_mgr.get(session_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if existing.tenant_id and existing.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
+
     ttl = payload.ttl_seconds if payload else None
     lease = await lease_mgr.heartbeat(session_id, ttl)
     if not lease:
@@ -167,13 +179,17 @@ async def session_heartbeat(
 @router.post("/{session_id}/release")
 async def release_session(
     session_id: str,
+    request: Request,
     driver: ContainerDriver = Depends(get_driver),
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
     """Explicitly release and terminate a session while releasing the workspace concurrency lock."""
+    tenant_id = getattr(request.state, "tenant_id", "default")
     lease = await lease_mgr.get(session_id)
     if not lease:
         raise HTTPException(status_code=404, detail="Session not found")
+    if lease.tenant_id and lease.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
 
     await lease_mgr.release(session_id)
     if lease.workspace_id:
@@ -195,10 +211,12 @@ async def release_session(
 # Proxied Session APIs (Auto-Heartbeat & Keepalive on each interaction)
 # =========================================================================
 
-async def _get_active_session(session_id: str, lease_mgr: LeaseManager) -> tuple[str, Optional[str]]:
+async def _get_active_session(session_id: str, lease_mgr: LeaseManager, tenant_id: str = "default") -> tuple[str, Optional[str]]:
     lease = await lease_mgr.get(session_id)
     if not lease or lease.status != "active":
         raise HTTPException(status_code=404, detail="Session not found or expired")
+    if lease.tenant_id and lease.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
     await lease_mgr.heartbeat(session_id)  # Auto-extend lease
     if lease.workspace_id:
         await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id)
@@ -211,9 +229,23 @@ async def proxy_exec(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     body = await request.json()
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+
+    # Audit log the command invocation
+    raw_cmd = body.get("command") or body.get("cmd") or body.get("script") or ""
+    cmd_summary = str(raw_cmd)[:500]
+    await lease_mgr.log_audit_event(
+        session_id=session_id,
+        event="command_exec",
+        details={
+            "command": cmd_summary,
+            "stream": body.get("stream", False),
+            "tenant_id": tenant_id,
+        },
+    )
 
     if body.get("stream", False):
         client = httpx.AsyncClient(timeout=None)
@@ -255,9 +287,18 @@ async def proxy_fs_write(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     body = await request.json()
+
+    # Audit log file write
+    await lease_mgr.log_audit_event(
+        session_id=session_id,
+        event="file_write",
+        details={"path": body.get("path", ""), "tenant_id": tenant_id},
+    )
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(f"{endpoint}/fs/write", json=body, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
@@ -267,9 +308,11 @@ async def proxy_fs_write(
 async def proxy_fs_read(
     session_id: str,
     path: str,
+    request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{endpoint}/fs/read", params={"path": path}, headers=headers)
@@ -279,10 +322,12 @@ async def proxy_fs_read(
 @router.get("/{session_id}/fs/list")
 async def proxy_fs_list(
     session_id: str,
+    request: Request,
     path: str = ".",
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{endpoint}/fs/list", params={"path": path}, headers=headers)
@@ -295,9 +340,18 @@ async def proxy_fs_delete(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     body = await request.json()
+
+    # Audit log file delete
+    await lease_mgr.log_audit_event(
+        session_id=session_id,
+        event="file_delete",
+        details={"path": body.get("path", ""), "tenant_id": tenant_id},
+    )
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(f"{endpoint}/fs/delete", json=body, headers=headers)
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
@@ -306,10 +360,12 @@ async def proxy_fs_delete(
 @router.get("/{session_id}/fs/quota")
 async def proxy_fs_quota(
     session_id: str,
+    request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
     """Retrieve workspace disk quota metrics (used, quota, usage percentage)."""
-    endpoint, auth_token = await _get_active_session(session_id, lease_mgr)
+    tenant_id = getattr(request.state, "tenant_id", "default")
+    endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{endpoint}/fs/quota", headers=headers)
