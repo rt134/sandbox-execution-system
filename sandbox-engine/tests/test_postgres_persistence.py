@@ -164,3 +164,89 @@ async def test_readyz_probe_reports_database_ready():
             data = response.json()
             assert data["status"] == "ready"
             assert data["database"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_token_encryption_at_rest(pg_backend):
+    """Verify that sensitive daemon auth tokens are encrypted at rest in PostgreSQL."""
+    session_id = f"enc_sess_{int(time.time() * 1000)}"
+    workspace_id = f"enc_ws_{int(time.time() * 1000)}"
+    plaintext_token = "secret_raw_token_xyz_12345"
+
+    lease = await pg_backend.create_or_renew_lease(
+        session_id=session_id,
+        workspace_id=workspace_id,
+        sandbox_id="sb_enc",
+        endpoint="http://127.0.0.1:5004",
+        ttl_seconds=300,
+        auth_token=plaintext_token,
+        tenant_id="tenant-alpha",
+    )
+    assert lease.auth_token == plaintext_token
+    assert lease.tenant_id == "tenant-alpha"
+
+    # Inspect the raw PostgreSQL table row
+    async with pg_backend._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT auth_token, tenant_id FROM leases WHERE session_id = $1",
+            session_id,
+        )
+        stored_token = row["auth_token"]
+        assert stored_token != plaintext_token
+        assert stored_token.startswith("gAAAAA")  # Fernet signature
+        assert row["tenant_id"] == "tenant-alpha"
+
+    # Decryption works seamlessly upon fetching through backend
+    fetched = await pg_backend.get_lease(session_id)
+    assert fetched.auth_token == plaintext_token
+
+
+@pytest.mark.asyncio
+async def test_atomic_claim_expired_leases(pg_backend):
+    """Verify that expired leases are atomically claimed without sweeper race conditions."""
+    session_id = f"exp_sess_{int(time.time() * 1000)}"
+    workspace_id = f"exp_ws_{int(time.time() * 1000)}"
+
+    # Create lease that already expired 10 seconds ago
+    now = time.time()
+    await pg_backend.create_or_renew_lease(
+        session_id=session_id,
+        workspace_id=workspace_id,
+        sandbox_id="sb_exp",
+        endpoint="http://127.0.0.1:5004",
+        ttl_seconds=-10,
+    )
+
+    # Claim expired leases
+    claimed = await pg_backend.claim_expired_leases(cutoff_time=now)
+    assert any(l.session_id == session_id for l in claimed)
+
+    # Status in database should now be 'reclaiming'
+    updated = await pg_backend.get_lease(session_id)
+    assert updated.status == "reclaiming"
+
+    # Subsequent claim should return nothing (no double sweep)
+    second_claim = await pg_backend.claim_expired_leases(cutoff_time=now)
+    assert not any(l.session_id == session_id for l in second_claim)
+
+
+def test_workspace_id_newline_rejected():
+    """Verify that workspace_id containing trailing newline is strictly rejected."""
+    from sandbox_engine.core.security import validate_workspace_id
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_workspace_id("ws\n")
+    assert exc_info.value.status_code == 400
+    assert "Invalid workspace_id" in exc_info.value.detail
+
+
+def test_production_mode_refuses_to_start_without_api_key(monkeypatch):
+    """Verify that production mode refuses to start without SANDBOX_API_KEY."""
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "api_key", None)
+    monkeypatch.setattr(settings, "postgres_url", "postgresql://user:pass@host:5432/db")
+
+    with pytest.raises(ValueError, match="Production environment requires SANDBOX_API_KEY"):
+        settings.validate_production_settings()
+
