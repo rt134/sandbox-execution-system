@@ -82,9 +82,10 @@ func sanitizePath(userPath string) (string, error) {
 		target = filepath.Clean(filepath.Join(root, userPath))
 	}
 
-	// Must start with workspace root
-	if !strings.HasPrefix(target, root) {
-		return "", fmt.Errorf("access denied: path '%s' is outside workspace '%s'", userPath, root)
+	// Must be contained within workspace root and cannot escape via traversal or prefix spoofing
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("access denied: path '%s' escapes workspace '%s'", userPath, root)
 	}
 
 	return target, nil
