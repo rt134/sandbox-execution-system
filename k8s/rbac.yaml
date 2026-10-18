@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandboxes
+  labels:
+    kubernetes.io/metadata.name: sandboxes
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-engine-sa
+  namespace: sandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-controller-role
+  namespace: sandboxes
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - pods/status
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-controller-binding
+  namespace: sandboxes
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-engine-sa
+    namespace: sandbox-system
+roleRef:
+  kind: Role
+  name: sandbox-controller-role
+  apiGroup: rbac.authorization.k8s.io

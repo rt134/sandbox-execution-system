@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-engine
+  namespace: sandbox-system
+  labels:
+    app.kubernetes.io/name: sandbox-engine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sandbox-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sandbox-engine
+    spec:
+      serviceAccountName: sandbox-engine-sa
+      containers:
+        - name: engine
+          image: sandbox-engine:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SANDBOX_ENVIRONMENT
+              value: "production"
+            - name: SANDBOX_DRIVER
+              value: "k8s"
+            - name: SANDBOX_K8S_NAMESPACE
+              value: "sandboxes"
+            - name: SANDBOX_K8S_USE_PVC
+              value: "true"
+            - name: SANDBOX_HTTP_PROXY
+              value: "http://squid-proxy.sandbox-system.svc.cluster.local:3128"
+            - name: SANDBOX_HTTPS_PROXY
+              value: "http://squid-proxy.sandbox-system.svc.cluster.local:3128"
+            - name: SANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-secrets
+                  key: api-key
+            - name: SANDBOX_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-secrets
+                  key: encryption-key
+            - name: SANDBOX_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-secrets
+                  key: postgres-url
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+              httpHeaders:
+                - name: Authorization
+                  value: "Bearer $(SANDBOX_API_KEY)"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+              httpHeaders:
+                - name: Authorization
+                  value: "Bearer $(SANDBOX_API_KEY)"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2.0"
+              memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-engine
+  namespace: sandbox-system
+  labels:
+    app.kubernetes.io/name: sandbox-engine
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sandbox-engine
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
