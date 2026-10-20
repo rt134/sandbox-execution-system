@@ -18,11 +18,18 @@ class RateLimiter:
       and maximum capacity to prevent memory exhaustion attacks.
     """
 
-    def __init__(self, redis_client=None, max_tracked_tenants: int = 5000):
+    def __init__(self, redis_client=None, pool=None, max_tracked_tenants: int = 5000):
         self.redis = redis_client
+        self.pool = pool
         self.max_tracked_tenants = max_tracked_tenants
         self._history: OrderedDict[str, List[float]] = OrderedDict()
         self._lock = asyncio.Lock()
+
+    def set_redis(self, redis_client):
+        self.redis = redis_client
+
+    def set_pool(self, pool):
+        self.pool = pool
 
     async def check_rate_limit(self, tenant_id: str, limit: Optional[int] = None) -> None:
         """
@@ -48,10 +55,48 @@ class RateLimiter:
             except HTTPException:
                 raise
             except Exception:
-                # Fall back to local memory if Redis call fails
+                # Fall back to PostgreSQL or local memory if Redis call fails
                 pass
 
-        # 2. Local Bounded Sliding Window Implementation
+        # 2. Distributed PostgreSQL Implementation (multi-replica synchronized)
+        if self.pool:
+            try:
+                now_minute = int(time.time() // 60)
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS tenant_rate_limits (
+                            tenant_id VARCHAR(64) NOT NULL,
+                            window_minute BIGINT NOT NULL,
+                            request_count INT DEFAULT 1,
+                            PRIMARY KEY (tenant_id, window_minute)
+                        )
+                        """
+                    )
+                    count = await conn.fetchval(
+                        """
+                        INSERT INTO tenant_rate_limits (tenant_id, window_minute, request_count)
+                        VALUES ($1, $2, 1)
+                        ON CONFLICT (tenant_id, window_minute)
+                        DO UPDATE SET request_count = tenant_rate_limits.request_count + 1
+                        RETURNING request_count
+                        """,
+                        tenant_id,
+                        now_minute,
+                    )
+                    if count and count > max_requests:
+                        raise HTTPException(
+                            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="Too Many Requests: rate limit exceeded for tenant",
+                            headers={"Retry-After": "60"},
+                        )
+                    return
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+
+        # 3. Local Bounded Sliding Window Implementation (fallback)
         now = time.time()
         cutoff = now - 60.0
 
