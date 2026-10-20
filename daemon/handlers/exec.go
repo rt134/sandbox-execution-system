@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -208,43 +209,45 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 	}
 }
 
+type cappedBuffer struct {
+	limit int
+	buf   bytes.Buffer
+}
+
+func newCappedBuffer(limit int) *cappedBuffer {
+	return &cappedBuffer{limit: limit}
+}
+
+func (c *cappedBuffer) Write(p []byte) (n int, err error) {
+	if c.buf.Len() < c.limit {
+		toWrite := c.limit - c.buf.Len()
+		if len(p) < toWrite {
+			toWrite = len(p)
+		}
+		c.buf.Write(p[:toWrite])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	return c.buf.String()
+}
+
+func (c *cappedBuffer) Bytes() []byte {
+	return c.buf.Bytes()
+}
+
+func (c *cappedBuffer) Len() int {
+	return c.buf.Len()
+}
+
 func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Context, start time.Time, timeoutSec float64) {
-	var stdoutBuf, stderrBuf []byte
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	stdoutBuf := newCappedBuffer(maxOutputBytes)
+	stderrBuf := newCappedBuffer(maxOutputBytes)
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
-	if err := cmd.Start(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Read up to maxOutputBytes and then continuously drain to io.Discard
-	// so the child process is never blocked on a full OS pipe buffer.
-	go func() {
-		defer wg.Done()
-		defer func() { _, _ = io.Copy(io.Discard, stdoutPipe) }()
-		stdoutBuf, _ = io.ReadAll(io.LimitReader(stdoutPipe, maxOutputBytes))
-	}()
-	go func() {
-		defer wg.Done()
-		defer func() { _, _ = io.Copy(io.Discard, stderrPipe) }()
-		stderrBuf, _ = io.ReadAll(io.LimitReader(stderrPipe, maxOutputBytes))
-	}()
-
-	// Wait for readers to finish reading pipes before cmd.Wait()
-	wg.Wait()
-	execErr := cmd.Wait()
+	execErr := cmd.Run()
 	durationMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 	exitCode := 0
@@ -268,8 +271,8 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 	}
 
 	resp := ExecFullResponse{
-		Stdout:     string(stdoutBuf),
-		Stderr:     string(stderrBuf),
+		Stdout:     stdoutBuf.String(),
+		Stderr:     stderrBuf.String(),
 		ExitCode:   exitCode,
 		DurationMs: durationMs,
 		Error:      errStr,

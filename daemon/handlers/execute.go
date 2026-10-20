@@ -96,9 +96,10 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	cmd.Stdin = bytes.NewReader(payloadBytes)
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutBuf := newCappedBuffer(maxOutputBytes)
+	stderrBuf := newCappedBuffer(maxOutputBytes)
+	cmd.Stdout = stdoutBuf
+	cmd.Stderr = stderrBuf
 
 	execErr := cmd.Run()
 	durationMs := float64(time.Since(start).Microseconds()) / 1000.0

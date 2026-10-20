@@ -4,3 +4,5 @@ import os
 if "ENV" not in os.environ and "ENVIRONMENT" not in os.environ and "SANDBOX_ENVIRONMENT" not in os.environ:
     os.environ["ENV"] = "development"
     os.environ["SANDBOX_ENVIRONMENT"] = "development"
+
+os.environ["SANDBOX_MAX_CONCURRENT_SESSIONS_PER_TENANT"] = "100"
