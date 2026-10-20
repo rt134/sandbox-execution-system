@@ -75,10 +75,10 @@ jobs:
       with:
         image-ref: 'sandbox-base:latest'
         format: 'table'
-        exit-code: '0'
+        exit-code: '1'
         ignore-unfixed: true
         vuln-type: 'os,library'
-        severity: 'CRITICAL,HIGH'
+        severity: 'CRITICAL'
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -92,10 +92,24 @@ jobs:
         go vet ./...
         go test -v ./handlers
 
-    - name: Test with pytest
+    - name: Create KinD Kubernetes Cluster
+      uses: helm/kind-action@v1.10.0
+      with:
+        cluster_name: kind-sandbox
+        node_image: kindest/node:v1.30.0
+
+    - name: Load Sandbox Image & Apply K8s Manifests
+      run: |
+        kind load docker-image sandbox-base:latest --name kind-sandbox
+        kubectl create namespace sandboxes || true
+        kubectl apply -f k8s/resource-quota.yaml
+        kubectl apply -f k8s/rbac.yaml
+        kubectl apply -f k8s/runtime-class.yaml || true
+
+    - name: Test with pytest & load test
       shell: bash -el {0}
       env:
         SANDBOX_POSTGRES_URL: postgresql://sandbox:sandbox@localhost:5432/sandbox
+        ENV: test
       run: |
-        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/
-
+        PYTHONPATH="sandbox-engine/src:sandbox-client/src" pytest sandbox-engine/tests/ sandbox-client/tests/
