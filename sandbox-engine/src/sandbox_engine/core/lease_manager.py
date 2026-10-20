@@ -591,6 +591,17 @@ class SQLiteLeaseBackend(LeaseBackend):
             )
             conn.commit()
 
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        return await asyncio.to_thread(self._sync_get_dead_engines, max_idle_sec)
+
+    def _sync_get_dead_engines(self, max_idle_sec: float) -> List[str]:
+        cutoff = time.time() - max_idle_sec
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT engine_id FROM engine_instances WHERE last_heartbeat < ?", (cutoff,))
+            rows = cursor.fetchall()
+            return [r[0] for r in rows]
+
     async def delete_dead_engine(self, engine_id: str) -> None:
         async with self._lock:
             await asyncio.to_thread(self._sync_delete_dead_engine, engine_id)
