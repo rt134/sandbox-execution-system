@@ -33,6 +33,7 @@ class EngineSettings(BaseSettings):
     encryption_key: str = os.environ.get("SANDBOX_ENCRYPTION_KEY", "sandbox-default-secret-key-change-in-prod-32bytes")
     cors_allowed_origins: List[str] = ["*"]
     max_request_size_bytes: int = 25 * 1024 * 1024  # 25MB request body cap
+    max_response_bytes: int = 10 * 1024 * 1024  # 10MB max buffered response payload cap
     max_stream_response_bytes: int = 50 * 1024 * 1024  # 50MB max streaming response
     max_ws_message_size_bytes: int = 1024 * 1024  # 1MB max WebSocket message
 
@@ -48,7 +49,7 @@ class EngineSettings(BaseSettings):
     max_concurrent_spawns: int = 10  # Cap concurrent container launches
 
     # Environment & Persistence (PostgreSQL)
-    environment: str = os.environ.get("ENV", os.environ.get("ENVIRONMENT", "development"))
+    environment: str = os.environ.get("ENV", os.environ.get("ENVIRONMENT", "production"))
     postgres_url: Optional[str] = (
         os.environ.get("SANDBOX_POSTGRES_URL")
         or os.environ.get("POSTGRES_URL")

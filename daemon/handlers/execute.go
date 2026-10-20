@@ -46,6 +46,10 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		timeoutSec = 10.0 // Default 10s
 	}
 
+	// Set dynamic write deadline on ResponseController
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(time.Duration((timeoutSec + 15) * float64(time.Second))))
+
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec*float64(time.Second)))
 	defer cancel()
 
@@ -75,8 +79,15 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set process group ID so we can kill any child processes spawned by user code
+	// Set process group ID and kill entire process group on cancellation
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 250 * time.Millisecond
 
 	// Prepare payload for runner
 	payloadBytes, _ := json.Marshal(map[string]interface{}{

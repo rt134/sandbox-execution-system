@@ -39,6 +39,6 @@ USER engine
 EXPOSE 8080
 
 HEALTHCHECK --interval=5s --timeout=3s --retries=3 --start-period=5s \
-    CMD curl -f http://localhost:8080/healthz || exit 1
+    CMD curl -f http://localhost:8080/livez || exit 1
 
 ENTRYPOINT ["uvicorn", "sandbox_engine.main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -63,6 +63,10 @@ func ExecHandler(w http.ResponseWriter, r *http.Request) {
 		timeoutSec = 300.0 // Default 5 minutes
 	}
 
+	// Dynamically configure write deadline per request using http.ResponseController
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(time.Duration((timeoutSec + 30) * float64(time.Second))))
+
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec*float64(time.Second)))
 	defer cancel()
 
@@ -76,7 +80,20 @@ func ExecHandler(w http.ResponseWriter, r *http.Request) {
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", req.Command)
 	cmd.Dir = cwd
+
+	// Create a new process group for command and all its children
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Kill entire process group on timeout immediately
+	cmd.Cancel = func() error {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+
+	// Forcibly close I/O pipes after 250ms delay if children hang on stdout/stderr
+	cmd.WaitDelay = 250 * time.Millisecond
 
 	// Environment variables
 	cmd.Env = os.Environ()
@@ -117,18 +134,33 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 	flusher, canFlush := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 
+	// Stream output chunk by chunk, handling lines > 1MB without buffer overflow,
+	// and draining remaining output to io.Discard once maxOutputBytes is reached.
 	streamOutput := func(r io.Reader, streamType string) {
-		scanner := bufio.NewScanner(io.LimitReader(r, maxOutputBytes))
-		buf := make([]byte, 64*1024)
-		scanner.Buffer(buf, 1024*1024)
+		defer func() {
+			_, _ = io.Copy(io.Discard, r)
+		}()
 
-		for scanner.Scan() {
-			_ = enc.Encode(ExecChunk{
-				Stream: streamType,
-				Text:   scanner.Text() + "\n",
-			})
-			if canFlush {
-				flusher.Flush()
+		limitedR := io.LimitReader(r, maxOutputBytes)
+		reader := bufio.NewReaderSize(limitedR, 64*1024)
+
+		for {
+			line, isPrefix, err := reader.ReadLine()
+			if len(line) > 0 {
+				chunkText := string(line)
+				if !isPrefix {
+					chunkText += "\n"
+				}
+				_ = enc.Encode(ExecChunk{
+					Stream: streamType,
+					Text:   chunkText,
+				})
+				if canFlush {
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				break
 			}
 		}
 	}
@@ -152,7 +184,7 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 	exitCode := 0
 	var errMsg string
 	if ctx.Err() == context.DeadlineExceeded {
-		if cmd.Process != nil {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		exitCode = 124
@@ -197,12 +229,16 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	// Read up to maxOutputBytes and then continuously drain to io.Discard
+	// so the child process is never blocked on a full OS pipe buffer.
 	go func() {
 		defer wg.Done()
+		defer func() { _, _ = io.Copy(io.Discard, stdoutPipe) }()
 		stdoutBuf, _ = io.ReadAll(io.LimitReader(stdoutPipe, maxOutputBytes))
 	}()
 	go func() {
 		defer wg.Done()
+		defer func() { _, _ = io.Copy(io.Discard, stderrPipe) }()
 		stderrBuf, _ = io.ReadAll(io.LimitReader(stderrPipe, maxOutputBytes))
 	}()
 
@@ -215,7 +251,7 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 	var errStr *string
 
 	if ctx.Err() == context.DeadlineExceeded {
-		if cmd.Process != nil {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 		exitCode = 124

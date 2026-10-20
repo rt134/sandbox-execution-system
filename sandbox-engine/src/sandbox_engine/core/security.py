@@ -12,13 +12,45 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..config import settings
 
-# Strict workspace ID regex: alphanumeric, underscores, hyphens, max 64 chars, strictly matching end of string \Z
-WORKSPACE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]{1,64}\Z")
+# Strict workspace ID regex: alphanumeric, underscores, hyphens, max 63 chars (capped for K8s label compliance), strictly matching \Z
+WORKSPACE_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-]{1,63}\Z")
 
 # Strict tenant ID regex: alphanumeric, underscores, hyphens, dots, max 63 chars (compatible with K8s label standard)
 TENANT_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]{1,63}\Z")
 
+# Strict session ID regex: alphanumeric, underscores, hyphens, dots, max 63 chars
+SESSION_ID_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]{1,63}\Z")
+
 security_bearer = HTTPBearer(auto_error=False)
+
+
+def safe_compare_digest(a: Optional[str], b: Optional[str]) -> bool:
+    """
+    Constant-time string comparison that safely handles non-ASCII characters
+    by encoding to UTF-8 bytes first. Prevents TypeError (500 Internal Server Error)
+    when non-ASCII characters are supplied in API keys.
+    """
+    if a is None or b is None:
+        return False
+    try:
+        return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def validate_session_id(session_id: str) -> str:
+    """Validates session_id against strict regex to prevent 500s from DB truncation or K8s label errors."""
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="session_id must be a non-empty string",
+        )
+    if not SESSION_ID_REGEX.fullmatch(session_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid session_id '{session_id}'. Must match pattern '^[a-zA-Z0-9_\\-\\.]+$' (max 63 chars)",
+        )
+    return session_id
 
 
 def _get_fernet() -> Fernet:
@@ -182,7 +214,7 @@ async def authenticate_tenant_credentials(
             )
 
     if expected_key:
-        if not provided_key or not secrets.compare_digest(provided_key, expected_key):
+        if not provided_key or not safe_compare_digest(provided_key, expected_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized: invalid or missing Sandbox API key",

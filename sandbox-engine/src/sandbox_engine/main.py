@@ -49,6 +49,12 @@ async def lifespan(app: FastAPI):
     )
     sweeper.start()
 
+    # Wire distributed rate limiter
+    if hasattr(lease_mgr.backend, "_pool") and lease_mgr.backend._pool:
+        rate_limiter.set_pool(lease_mgr.backend._pool)
+    elif hasattr(lease_mgr.backend, "redis") and lease_mgr.backend.redis:
+        rate_limiter.set_redis(lease_mgr.backend.redis)
+
     app.state.driver = driver
     app.state.lease_manager = lease_mgr
     app.state.sweeper = sweeper
@@ -124,9 +130,15 @@ app.include_router(sessions_router)
 app.include_router(ws_router)
 
 
-@app.get("/healthz", tags=["System"], dependencies=[Depends(verify_api_key)])
+@app.get("/livez", tags=["System"])
+async def livez():
+    """Kubernetes liveness probe: returns 200 if server process is running without tenant auth."""
+    return {"status": "alive"}
+
+
+@app.get("/healthz", tags=["System"])
 async def healthz():
-    """Liveness probe: returns 200 if server process is running."""
+    """System health check: returns component status without requiring tenant auth."""
     driver_name = getattr(app.state, "driver", None).__class__.__name__ if hasattr(app.state, "driver") else "unknown"
     pool_size = app.state.warm_pool.queue.qsize() if hasattr(app.state, "warm_pool") else 0
     active_leases = len(await app.state.lease_manager.list_active()) if hasattr(app.state, "lease_manager") else 0
@@ -139,7 +151,7 @@ async def healthz():
     }
 
 
-@app.get("/readyz", tags=["System"], dependencies=[Depends(verify_api_key)])
+@app.get("/readyz", tags=["System"])
 async def readyz():
     """Readiness probe: validates backend container driver, database ledger, and warm pool availability."""
     if not hasattr(app.state, "driver") or not hasattr(app.state, "warm_pool"):

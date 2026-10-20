@@ -25,7 +25,7 @@ ENV WORKSPACE_DIR=/workspace
 ENV PYTHON_RUNNER_PATH=/opt/runner/python_runner.py
 ENV SHELL=/bin/bash
 
-# Install essential system tools & Node.js 20 LTS
+# Install essential system tools, tini init, & Node.js 20 LTS
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     tar \
     procps \
+    tini \
     ca-certificates \
     gnupg \
     && mkdir -p /etc/apt/keyrings \
@@ -66,4 +67,4 @@ USER sandbox
 # Expose internal daemon port
 EXPOSE 5004
 
-ENTRYPOINT ["/usr/local/bin/shellctl"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/shellctl"]

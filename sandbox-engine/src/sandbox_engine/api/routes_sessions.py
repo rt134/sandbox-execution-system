@@ -11,7 +11,12 @@ from fastapi.responses import StreamingResponse
 from ..config import settings
 from ..core.lease_manager import LeaseManager
 from ..core.metrics import ACTIVE_SESSIONS, WORKSPACE_LOCKS_ACTIVE
-from ..core.security import generate_daemon_token, validate_workspace_id, verify_api_key
+from ..core.security import (
+    generate_daemon_token,
+    validate_session_id,
+    validate_workspace_id,
+    verify_api_key,
+)
 from ..drivers.base import ContainerDriver
 from ..models import (
     HeartbeatRequest,
@@ -47,6 +52,8 @@ async def acquire_session(
     Acquire or resume a stateful agent session with a mounted workspace volume.
     Enforces strict path validation against directory traversal and atomic concurrency locking.
     """
+    if payload.session_id:
+        validate_session_id(payload.session_id)
     session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
     workspace_id = payload.workspace_id
     ttl = payload.ttl_seconds or settings.default_session_ttl
@@ -257,6 +264,7 @@ async def release_session(
 # =========================================================================
 
 async def _get_active_session(session_id: str, lease_mgr: LeaseManager, tenant_id: str = "default") -> tuple[str, Optional[str]]:
+    validate_session_id(session_id)
     lease = await lease_mgr.get(session_id)
     if not lease or lease.status != "active":
         raise HTTPException(status_code=404, detail="Session not found or expired")
@@ -274,6 +282,7 @@ async def proxy_exec(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
+    validate_session_id(session_id)
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     body = await request.json()
@@ -323,11 +332,28 @@ async def proxy_exec(
 
         return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
-    # Buffered execution with auto-keepalive
+    # Buffered execution with auto-keepalive to prevent lease sweep during long execution
     timeout_val = float(body.get("timeout", 300.0))
-    async with httpx.AsyncClient(timeout=timeout_val + 10.0) as client:
-        resp = await client.post(f"{endpoint}/exec", json=body, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+    stop_keepalive = asyncio.Event()
+
+    async def buffered_keepalive_loop():
+        while not stop_keepalive.is_set():
+            try:
+                await asyncio.wait_for(stop_keepalive.wait(), timeout=15.0)
+                break
+            except asyncio.TimeoutError:
+                await lease_mgr.heartbeat(session_id)
+
+    keepalive_task = asyncio.create_task(buffered_keepalive_loop())
+    try:
+        async with httpx.AsyncClient(timeout=timeout_val + 10.0) as client:
+            resp = await client.post(f"{endpoint}/exec", json=body, headers=headers)
+            if len(resp.content) > settings.max_response_bytes:
+                raise HTTPException(status_code=413, detail="Execution response exceeds maximum allowed size")
+            return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+    finally:
+        stop_keepalive.set()
+        keepalive_task.cancel()
 
 
 @router.post("/{session_id}/fs/write")
@@ -336,6 +362,7 @@ async def proxy_fs_write(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
+    validate_session_id(session_id)
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
@@ -360,11 +387,14 @@ async def proxy_fs_read(
     request: Request,
     lease_mgr: LeaseManager = Depends(get_lease_manager),
 ):
+    validate_session_id(session_id)
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.get(f"{endpoint}/fs/read", params={"path": path}, headers=headers)
+        if len(resp.content) > settings.max_response_bytes:
+            raise HTTPException(status_code=413, detail="File content exceeds maximum allowed size")
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
 

@@ -67,6 +67,12 @@ async def run_stateless_code(
                 },
             )
 
+        if len(resp.content) > settings.max_response_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Stateless response payload exceeds maximum allowed limit (10MB)",
+            )
+
         if resp.status_code != 200:
             status = "failed"
             raise HTTPException(

@@ -72,9 +72,14 @@ func getWorkspaceDiskUsage() int64 {
 	return totalSize
 }
 
-// sanitizePath ensures path does not escape workspace directory
+// sanitizePath ensures path does not escape workspace directory, resolving symlinks
 func sanitizePath(userPath string) (string, error) {
 	root := getWorkspaceRoot()
+	evalRoot, err := filepath.EvalSymlinks(root)
+	if err == nil {
+		root = evalRoot
+	}
+
 	var target string
 	if filepath.IsAbs(userPath) {
 		target = filepath.Clean(userPath)
@@ -82,10 +87,36 @@ func sanitizePath(userPath string) (string, error) {
 		target = filepath.Clean(filepath.Join(root, userPath))
 	}
 
-	// Must be contained within workspace root and cannot escape via traversal or prefix spoofing
+	// Lexical check: must be contained within workspace root
 	rel, err := filepath.Rel(root, target)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("access denied: path '%s' escapes workspace '%s'", userPath, root)
+	}
+
+	// Symlink resolution check
+	evalTarget, err := filepath.EvalSymlinks(target)
+	if err == nil {
+		// Target exists: verify resolved target does not escape resolved workspace root
+		relEval, err := filepath.Rel(root, evalTarget)
+		if err != nil || relEval == ".." || strings.HasPrefix(relEval, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("access denied: symlink '%s' resolves outside workspace", userPath)
+		}
+		return evalTarget, nil
+	} else if os.IsNotExist(err) {
+		// Target does not exist yet (e.g. creating a new file on write).
+		// Check nearest existing ancestor directory to prevent writing through a symlinked directory.
+		dir := filepath.Dir(target)
+		for dir != "/" && dir != "." {
+			evalDir, err := filepath.EvalSymlinks(dir)
+			if err == nil {
+				relEval, err := filepath.Rel(root, evalDir)
+				if err != nil || relEval == ".." || strings.HasPrefix(relEval, ".."+string(filepath.Separator)) {
+					return "", fmt.Errorf("access denied: symlink ancestor '%s' resolves outside workspace", dir)
+				}
+				break
+			}
+			dir = filepath.Dir(dir)
+		}
 	}
 
 	return target, nil

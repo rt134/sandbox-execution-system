@@ -129,6 +129,14 @@ class LeaseBackend(ABC):
     async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
         pass
 
+    @abstractmethod
+    async def delete_dead_engine(self, engine_id: str) -> None:
+        pass
+
+    @abstractmethod
+    async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
+        pass
+
 
 class SQLiteLeaseBackend(LeaseBackend):
     def __init__(self, db_path: str):
@@ -199,7 +207,14 @@ class SQLiteLeaseBackend(LeaseBackend):
             conn.commit()
 
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
+        self,
+        session_id: str,
+        workspace_id: str,
+        sandbox_id: str,
+        endpoint: str,
+        ttl_seconds: int,
+        auth_token: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> LeaseRecord:
         async with self._lock:
             now = time.time()
@@ -213,6 +228,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                 expires_at=expires_at,
                 status="active",
                 auth_token=auth_token,
+                tenant_id=tenant_id,
             )
             await asyncio.to_thread(self._sync_save, record)
             return record
@@ -221,8 +237,8 @@ class SQLiteLeaseBackend(LeaseBackend):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.session_id,
@@ -233,7 +249,70 @@ class SQLiteLeaseBackend(LeaseBackend):
                     record.expires_at,
                     record.status,
                     record.auth_token,
+                    getattr(record, "tenant_id", "default"),
                 ),
+            )
+            conn.commit()
+
+    async def claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_claim_expired_leases, cutoff_time)
+
+    def _sync_claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at < ?",
+                (cutoff_time,),
+            )
+            rows = cursor.fetchall()
+            if rows:
+                conn.execute(
+                    "UPDATE leases SET status = 'reclaiming' WHERE status = 'active' AND expires_at < ?",
+                    (cutoff_time,),
+                )
+                conn.commit()
+            return [
+                LeaseRecord(
+                    session_id=r[0],
+                    workspace_id=r[1],
+                    sandbox_id=r[2],
+                    endpoint=r[3],
+                    created_at=r[4],
+                    expires_at=r[5],
+                    status="reclaiming",
+                    auth_token=r[7] if len(r) > 7 else None,
+                    tenant_id=r[8] if len(r) > 8 and r[8] else "default",
+                )
+                for r in rows
+            ]
+
+    async def log_audit_event(
+        self,
+        session_id: str,
+        event_type: str = "custom",
+        details: Optional[dict] = None,
+        workspace_id: str = "",
+    ):
+        await asyncio.to_thread(self._sync_log_audit_event, session_id, event_type, details or {}, workspace_id)
+
+    def _sync_log_audit_event(self, session_id: str, event_type: str, details: dict, workspace_id: str):
+        now = time.time()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    workspace_id TEXT,
+                    event_type TEXT NOT NULL,
+                    details TEXT,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, workspace_id, event_type, json.dumps(details), now),
             )
             conn.commit()
 
@@ -512,16 +591,27 @@ class SQLiteLeaseBackend(LeaseBackend):
             )
             conn.commit()
 
-    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
-        return await asyncio.to_thread(self._sync_get_dead_engines, max_idle_sec)
+    async def delete_dead_engine(self, engine_id: str) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._sync_delete_dead_engine, engine_id)
 
-    def _sync_get_dead_engines(self, max_idle_sec: float) -> List[str]:
-        cutoff = time.time() - max_idle_sec
+    def _sync_delete_dead_engine(self, engine_id: str):
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT engine_id FROM engine_instances WHERE last_heartbeat < ?", (cutoff,))
-            rows = cursor.fetchall()
-            return [r[0] for r in rows]
+            conn.execute("DELETE FROM engine_instances WHERE engine_id = ?", (engine_id,))
+            conn.commit()
+
+    async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._sync_prune_database_records, retention_seconds)
+
+    def _sync_prune_database_records(self, retention_seconds: float):
+        cutoff = time.time() - retention_seconds
+        stale_engine_cutoff = time.time() - 86400.0
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM leases WHERE status IN ('expired', 'released') AND expires_at < ?", (cutoff,))
+            conn.execute("DELETE FROM session_audit_logs WHERE created_at < ?", (cutoff,))
+            conn.execute("DELETE FROM engine_instances WHERE last_heartbeat < ?", (stale_engine_cutoff,))
+            conn.commit()
 
 
 class RedisLeaseBackend(LeaseBackend):
@@ -529,7 +619,14 @@ class RedisLeaseBackend(LeaseBackend):
         self.redis = redis_client
 
     async def create_or_renew_lease(
-        self, session_id: str, workspace_id: str, sandbox_id: str, endpoint: str, ttl_seconds: int, auth_token: Optional[str] = None
+        self,
+        session_id: str,
+        workspace_id: str,
+        sandbox_id: str,
+        endpoint: str,
+        ttl_seconds: int,
+        auth_token: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> LeaseRecord:
         now = time.time()
         expires_at = now + ttl_seconds
@@ -542,12 +639,54 @@ class RedisLeaseBackend(LeaseBackend):
             expires_at=expires_at,
             status="active",
             auth_token=auth_token,
+            tenant_id=tenant_id,
         )
 
         data = record.model_dump_json()
         await self.redis.set(f"lease:{session_id}", data, ex=ttl_seconds)
         await self.redis.sadd("leases:active", session_id)
         return record
+
+    async def claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
+        expired = []
+        active_ids = await self.redis.smembers("leases:active")
+        for sid_bytes in active_ids:
+            sid = sid_bytes.decode("utf-8") if isinstance(sid_bytes, bytes) else str(sid_bytes)
+            lease = await self.get_lease(sid)
+            if lease and lease.status == "active" and lease.expires_at < cutoff_time:
+                lease.status = "reclaiming"
+                await self.redis.set(f"lease:{sid}", lease.model_dump_json(), ex=60)
+                expired.append(lease)
+            elif not lease:
+                expired.append(
+                    LeaseRecord(
+                        session_id=sid,
+                        workspace_id="",
+                        sandbox_id="",
+                        endpoint="",
+                        created_at=0,
+                        expires_at=0,
+                        status="reclaiming",
+                    )
+                )
+        return expired
+
+    async def log_audit_event(
+        self,
+        session_id: str,
+        event_type: str = "custom",
+        details: Optional[dict] = None,
+        workspace_id: str = "",
+    ):
+        event = {
+            "session_id": session_id,
+            "workspace_id": workspace_id,
+            "event_type": event_type,
+            "details": details or {},
+            "created_at": time.time(),
+        }
+        await self.redis.lpush(f"audit:{session_id}", json.dumps(event))
+        await self.redis.ltrim(f"audit:{session_id}", 0, 99)
 
     async def heartbeat(self, session_id: str, ttl_seconds: int) -> Optional[LeaseRecord]:
         record = await self.get_lease(session_id)
@@ -701,6 +840,33 @@ class RedisLeaseBackend(LeaseBackend):
                 tenant_id=tenant_id,
             )
         return True
+
+    async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
+        leases = await self.list_active_leases()
+        return sum(1 for l in leases if getattr(l, "tenant_id", "default") == tenant_id and l.status == "active")
+
+    async def register_engine_heartbeat(self, engine_id: str) -> None:
+        now = time.time()
+        await self.redis.set(f"engine:heartbeat:{engine_id}", str(now), ex=120)
+        await self.redis.sadd("engines:active", engine_id)
+
+    async def get_dead_engines(self, max_idle_sec: float = 60.0) -> List[str]:
+        now = time.time()
+        dead = []
+        engine_ids = await self.redis.smembers("engines:active")
+        for eid_bytes in engine_ids:
+            eid = eid_bytes.decode("utf-8") if isinstance(eid_bytes, bytes) else str(eid_bytes)
+            raw = await self.redis.get(f"engine:heartbeat:{eid}")
+            if not raw or (now - float(raw.decode("utf-8") if isinstance(raw, bytes) else str(raw))) > max_idle_sec:
+                dead.append(eid)
+        return dead
+
+    async def delete_dead_engine(self, engine_id: str) -> None:
+        await self.redis.delete(f"engine:heartbeat:{engine_id}")
+        await self.redis.srem("engines:active", engine_id)
+
+    async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
+        await self.cleanup_expired_workspace_locks()
 
 
 class PostgresLeaseBackend(LeaseBackend):
@@ -1190,6 +1356,18 @@ class PostgresLeaseBackend(LeaseBackend):
             )
             return [r["engine_id"] for r in rows]
 
+    async def delete_dead_engine(self, engine_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute("DELETE FROM engine_instances WHERE engine_id = $1", engine_id)
+
+    async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
+        cutoff = time.time() - retention_seconds
+        stale_engine_cutoff = time.time() - 86400.0
+        async with self._pool.acquire() as conn:
+            await conn.execute("DELETE FROM leases WHERE status IN ('expired', 'released') AND expires_at < $1", cutoff)
+            await conn.execute("DELETE FROM session_audit_logs WHERE created_at < $1", cutoff)
+            await conn.execute("DELETE FROM engine_instances WHERE last_heartbeat < $1", stale_engine_cutoff)
+
 
 class LeaseManager:
     """
@@ -1370,3 +1548,11 @@ class LeaseManager:
         if hasattr(self._backend, "get_dead_engines"):
             return await self._backend.get_dead_engines(max_idle_sec)
         return []
+
+    async def delete_dead_engine(self, engine_id: str) -> None:
+        if hasattr(self._backend, "delete_dead_engine"):
+            await self._backend.delete_dead_engine(engine_id)
+
+    async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
+        if hasattr(self._backend, "prune_database_records"):
+            await self._backend.prune_database_records(retention_seconds)

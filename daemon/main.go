@@ -96,7 +96,7 @@ func main() {
 		Addr:         addr,
 		Handler:      loggingMiddleware(authMiddleware(mux)),
 		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 120 * time.Second,
+		WriteTimeout: 0, // Disabled at server level to permit long-running commands (up to 1800s); deadlines enforced per-request via http.ResponseController
 	}
 
 	// Handle graceful shutdown

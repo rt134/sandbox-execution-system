@@ -40,3 +40,7 @@ class ContainerDriver(ABC):
     async def is_alive(self, sandbox_id: str) -> bool:
         """Check if container or pod is actively running."""
         pass
+
+    async def cleanup_orphaned_pvcs(self, active_workspace_keys: set[str], max_age_seconds: float = 86400.0) -> int:
+        """Garbage collect unused or orphaned persistent volume claims (K8s driver only)."""
+        return 0

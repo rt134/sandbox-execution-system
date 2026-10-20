@@ -143,6 +143,7 @@ class KubernetesDriver(ContainerDriver):
         container = client.V1Container(
             name="sandbox-kernel",
             image=spec.image,
+            image_pull_policy="IfNotPresent",
             ports=[client.V1ContainerPort(container_port=5004)],
             env=container_env,
             volume_mounts=volume_mounts if volume_mounts else None,
@@ -177,18 +178,30 @@ class KubernetesDriver(ContainerDriver):
         except ApiException as e:
             raise RuntimeError(f"Failed to create sandbox pod {pod_name}: {e}")
 
-        # Wait for Pod IP
+        # Wait for Pod IP and Pod Ready condition (handles cold starts and image pulls up to 60s)
         pod_ip = None
-        for _ in range(60):  # Retry up to 30 seconds
+        for _ in range(120):  # Retry up to 60 seconds
             await asyncio.sleep(0.5)
             curr = await self._core_api.read_namespaced_pod(name=pod_name, namespace=namespace)
-            if curr.status.pod_ip:
+            if curr.status and curr.status.pod_ip:
                 pod_ip = curr.status.pod_ip
-                break
+                # Check for Ready condition
+                is_ready = False
+                if curr.status.conditions:
+                    for cond in curr.status.conditions:
+                        if cond.type == "Ready" and cond.status == "True":
+                            is_ready = True
+                            break
+                if not is_ready and curr.status.container_statuses:
+                    is_ready = any(cs.ready for cs in curr.status.container_statuses if cs.name == "sandbox-kernel")
+
+                # If ready or phase is Running with IP
+                if is_ready or curr.status.phase == "Running":
+                    break
 
         if not pod_ip:
             await self.destroy_sandbox(pod_name)
-            raise TimeoutError(f"Pod {pod_name} did not acquire an IP in time")
+            raise TimeoutError(f"Pod {pod_name} did not acquire an IP or become Ready in time")
 
         endpoint = f"http://{pod_ip}:5004"
         return SandboxInstance(
@@ -259,7 +272,7 @@ class KubernetesDriver(ContainerDriver):
             headers["Authorization"] = f"Bearer {auth_token}"
 
         async with httpx.AsyncClient(timeout=0.5, headers=headers) as client:
-            for _ in range(20):
+            for _ in range(50):  # Retries up to 5s to tolerate cold starts
                 try:
                     resp = await client.get(f"{endpoint}/health")
                     if resp.status_code == 200:
@@ -325,3 +338,57 @@ class KubernetesDriver(ContainerDriver):
             if e.status == 404:
                 return False
             raise
+
+    async def cleanup_orphaned_pvcs(self, active_workspace_keys: set[str], max_age_seconds: float = 86400.0) -> int:
+        """
+        Garbage collect PVCs that are not associated with any active workspace
+        and not mounted by any running pod, preventing ResourceQuota exhaustion (150 PVC cap).
+        """
+        await self._init_client()
+        namespace = settings.k8s_namespace
+        deleted_count = 0
+        try:
+            pvcs = await self._core_api.list_namespaced_persistent_volume_claim(
+                namespace=namespace,
+                label_selector="sandbox.managed=true",
+            )
+            running_pods = await self._core_api.list_namespaced_pod(
+                namespace=namespace,
+                label_selector="sandbox.managed=true",
+            )
+            mounted_pvcs = set()
+            for pod in running_pods.items:
+                if pod.spec and pod.spec.volumes:
+                    for vol in pod.spec.volumes:
+                        if vol.persistent_volume_claim:
+                            mounted_pvcs.add(vol.persistent_volume_claim.claim_name)
+
+            now = time.time()
+            for pvc in pvcs.items:
+                pvc_name = pvc.metadata.name
+                if pvc_name in mounted_pvcs:
+                    continue  # In active use by a running pod
+
+                labels = pvc.metadata.labels or {}
+                tenant_id = labels.get("sandbox.tenant_id", "default")
+                workspace_id = labels.get("sandbox.workspace_id", "")
+                scope_key = f"{tenant_id}:{workspace_id}"
+
+                if scope_key in active_workspace_keys:
+                    continue  # Active session exists for this workspace
+
+                created_at = float(labels.get("sandbox.created_at", 0.0))
+                if created_at > 0 and (now - created_at) > max_age_seconds:
+                    logger.info(f"🧹 [PVC GC] Deleting orphaned PVC '{pvc_name}' for workspace '{scope_key}'")
+                    try:
+                        await self._core_api.delete_namespaced_persistent_volume_claim(
+                            name=pvc_name,
+                            namespace=namespace,
+                        )
+                        deleted_count += 1
+                    except ApiException as e:
+                        if e.status != 404:
+                            logger.error(f"Failed to delete PVC {pvc_name}: {e}")
+        except Exception as e:
+            logger.error(f"Error during PVC garbage collection: {e}")
+        return deleted_count

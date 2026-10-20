@@ -73,7 +73,7 @@ class Sweeper:
         for lease in expired_leases:
             logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
             try:
-                if lease.sandbox_id:
+                if lease.sandbox_id and lease.sandbox_id != "pending":
                     await self.driver.destroy_sandbox(lease.sandbox_id)
                 SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
             except Exception as e:
@@ -89,9 +89,10 @@ class Sweeper:
         await self.lease_manager.cleanup_expired_workspace_locks()
 
         # 3. Dead Container Reconciliation: Check active leases whose container has crashed/exited
+        # Critical: skip 'pending' leases that are currently in the process of pod creation!
         active_leases = await self.lease_manager.list_active()
         for lease in active_leases:
-            if lease.sandbox_id:
+            if lease.sandbox_id and lease.sandbox_id != "pending":
                 try:
                     alive = await self.driver.is_alive(lease.sandbox_id)
                     if not alive:
@@ -123,12 +124,14 @@ class Sweeper:
                             SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_engine_warm_reaped").inc()
                         except Exception as e:
                             logger.error(f"Failed to reap sandbox {sbx.sandbox_id} from dead engine: {e}")
+                    # Prune dead engine so it does not accumulate and cause repeated K8s list calls
+                    await self.lease_manager.delete_dead_engine(dead_id)
         except Exception as e:
             logger.error(f"Failed to check dead engines: {e}")
 
         # 5. Orphan stateful container garbage collection
         try:
-            active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id}
+            active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id and l.sandbox_id != "pending"}
 
             running_sandboxes = await self.driver.list_sandboxes(labels={"sandbox.type": "stateful"})
             for sbx in running_sandboxes:
@@ -163,6 +166,22 @@ class Sweeper:
                             SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_warm_container").inc()
                         except Exception as e:
                             logger.error(f"Failed to destroy orphan warm sandbox {sbx.sandbox_id}: {e}")
+
+            # 7. Kubernetes PVC Garbage Collection
+            try:
+                active_workspace_keys = {
+                    f"{l.tenant_id or 'default'}:{l.workspace_id}" for l in active_leases if l.workspace_id
+                }
+                if hasattr(self.driver, "cleanup_orphaned_pvcs"):
+                    await self.driver.cleanup_orphaned_pvcs(active_workspace_keys)
+            except Exception as e:
+                logger.error(f"Failed to run PVC garbage collection: {e}")
+
+            # 8. Prune database records (expired leases, audit logs, stale engines)
+            try:
+                await self.lease_manager.prune_database_records()
+            except Exception as e:
+                logger.error(f"Failed to prune database records: {e}")
 
             # Update Prometheus gauges
             ACTIVE_SESSIONS.set(len(active_leases))

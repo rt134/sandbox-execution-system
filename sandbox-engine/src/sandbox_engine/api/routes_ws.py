@@ -8,7 +8,7 @@ import websockets
 
 from ..config import settings
 from ..core.lease_manager import LeaseManager
-from ..core.security import authenticate_tenant_credentials
+from ..core.security import authenticate_tenant_credentials, validate_session_id
 
 logger = logging.getLogger("sandbox.routes_ws")
 router = APIRouter(prefix="/v1/sessions", tags=["WebSocket PTY"])
@@ -30,6 +30,7 @@ async def websocket_pty_proxy(websocket: WebSocket, session_id: str):
     has_query_token = "token" in websocket.query_params
 
     try:
+        validate_session_id(session_id)
         tenant_id = await authenticate_tenant_credentials(
             provided_key=token,
             raw_tenant=raw_tenant,
