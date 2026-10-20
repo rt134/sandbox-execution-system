@@ -16,7 +16,7 @@ import time
 import httpx
 import pytest
 
-from sandbox_engine.config import EngineSettings
+from sandbox_engine.config import EngineSettings, settings
 from sandbox_engine.core.lease_manager import LeaseManager
 from sandbox_engine.core.security import validate_workspace_id
 from sandbox_engine.drivers.base import ContainerDriver
@@ -48,41 +48,39 @@ class MockDriver(ContainerDriver):
 
 
 @pytest.mark.asyncio
-async def test_cross_tenant_workspace_ownership_rejection():
-    """Verify that workspaces are tenant-owned and cross-tenant acquire returns HTTP 403."""
+async def test_two_tenants_both_use_main_workspace():
+    """Verify that workspace names and locks are scoped to (tenant_id, workspace_id) so two tenants can both use 'main'."""
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             headers_tenant_a = {"X-Tenant-ID": "tenant_alpha"}
             headers_tenant_b = {"X-Tenant-ID": "tenant_bravo"}
 
-            # 1. Tenant A acquires workspace 'shared_codebase'
+            # 1. Tenant A acquires workspace 'main'
             resp_a = await client.post(
                 "/v1/sessions/acquire",
-                json={"workspace_id": "shared_codebase", "ttl_seconds": 60},
+                json={"workspace_id": "main", "ttl_seconds": 60},
                 headers=headers_tenant_a,
             )
-            assert resp_a.status_code == 200, f"Tenant A failed to acquire: {resp_a.text}"
+            assert resp_a.status_code == 200, f"Tenant A failed to acquire 'main': {resp_a.text}"
             sess_a_data = resp_a.json()
             sess_a_id = sess_a_data["session_id"]
 
-            # Release session so workspace lock is idle
-            resp_rel = await client.post(
-                f"/v1/sessions/{sess_a_id}/release",
-                headers=headers_tenant_a,
-            )
-            assert resp_rel.status_code == 200
-
-            # 2. Tenant B attempts to acquire Tenant A's idle workspace 'shared_codebase'
+            # 2. Tenant B also acquires workspace 'main' concurrently without 403 or 409 conflict
             resp_b = await client.post(
                 "/v1/sessions/acquire",
-                json={"workspace_id": "shared_codebase", "ttl_seconds": 60},
+                json={"workspace_id": "main", "ttl_seconds": 60},
                 headers=headers_tenant_b,
             )
+            assert resp_b.status_code == 200, f"Tenant B should be able to acquire their own 'main': {resp_b.text}"
+            sess_b_data = resp_b.json()
+            sess_b_id = sess_b_data["session_id"]
 
-            # MUST return 403 Forbidden!
-            assert resp_b.status_code == 403, f"Expected 403 Forbidden, got {resp_b.status_code}: {resp_b.text}"
-            assert "owned by another tenant" in resp_b.text
+            assert sess_a_id != sess_b_id, "Different tenants must get distinct sessions"
+
+            # Clean up
+            await client.post(f"/v1/sessions/{sess_a_id}/release", headers=headers_tenant_a)
+            await client.post(f"/v1/sessions/{sess_b_id}/release", headers=headers_tenant_b)
 
 
 def test_physical_directory_tenant_scoping(tmp_path):
@@ -165,7 +163,7 @@ def test_production_secret_validation():
         docker_runtime="runc",
         allow_insecure_docker_production=False,
     )
-    with pytest.raises(ValueError, match="without strong isolation"):
+    with pytest.raises(ValueError, match="strong container isolation"):
         s4.validate_production_settings()
 
     # 5. Strong production settings pass validation
@@ -298,4 +296,87 @@ def test_websocket_cross_tenant_rejection():
             ):
                 pass
         assert excinfo.value.code == 4403, f"Expected WS close code 4403, got {excinfo.value.code}"
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_flood_does_not_affect_victim_tenant():
+    """Verify that an unauthenticated attacker spraying requests with victim's tenant ID does NOT rate-limit the victim."""
+    orig_api_key = settings.api_key
+    settings.api_key = "secure_test_api_key_32_characters_long"
+    try:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                victim_tenant = "victim_corp"
+                attacker_headers = {"X-Tenant-ID": victim_tenant}  # No API key provided
+
+                # 1. Attacker sends 150 unauthenticated requests claiming to be victim
+                for _ in range(150):
+                    r = await client.get("/v1/sessions/any_session/fs/read?path=file.txt", headers=attacker_headers)
+                    assert r.status_code == 401, f"Expected 401 Unauthorized for unauthenticated attacker, got {r.status_code}"
+
+                # 2. Victim makes a legitimate request with their verified tenant header and valid API key
+                victim_headers = {
+                    "X-Tenant-ID": victim_tenant,
+                    "Authorization": f"Bearer {settings.api_key}",
+                }
+                resp = await client.get("/v1/sessions/sess_nonexistent/fs/read?path=file.txt", headers=victim_headers)
+
+                # Must NOT be 429 Too Many Requests!
+                assert resp.status_code != 429, f"Victim tenant was unfairly rate-limited by unauthenticated flood! Status: {resp.status_code}"
+                assert resp.status_code in (200, 404), f"Legitimate request should succeed auth, got {resp.status_code}"
+    finally:
+        settings.api_key = orig_api_key
+
+
+def test_malformed_tenant_keys_json_fails_startup():
+    """Verify that malformed or invalid SANDBOX_TENANT_KEYS_JSON fails startup immediately."""
+    # Malformed JSON syntax
+    s_bad_json = EngineSettings(tenant_keys_json="{not-valid-json")
+    with pytest.raises(ValueError, match="malformed JSON"):
+        s_bad_json.validate_tenant_keys_json()
+
+    # Non-dictionary structure
+    s_list = EngineSettings(tenant_keys_json='["tenant1", "key1"]')
+    with pytest.raises(ValueError, match="JSON dictionary"):
+        s_list.validate_tenant_keys_json()
+
+    # Invalid tenant_id format (injection/special chars)
+    s_bad_id = EngineSettings(tenant_keys_json='{"invalid tenant!": "key123456789012345678901234567890"}')
+    with pytest.raises(ValueError, match="Invalid tenant_id"):
+        s_bad_id.validate_tenant_keys_json()
+
+
+def test_k8s_driver_skips_host_directory_creation(tmp_path):
+    """Verify that K8s driver skips host directory creation to comply with readOnlyRootFilesystem."""
+    import os
+    non_existent_readonly_root = str(tmp_path / "k8s_readonly_workspaces")
+    # Do not create directory on host
+    ws_path = validate_workspace_id("my_workspace", non_existent_readonly_root, tenant_id="test_k8s_tenant", create_host_dir=False)
+    assert ws_path.endswith("my_workspace")
+    assert not os.path.exists(ws_path), "Host directory must NOT be created when create_host_dir=False"
+
+
+@pytest.mark.asyncio
+async def test_tenant_id_regex_format_validation():
+    """Verify that malformed tenant_id (path traversal, special characters) is rejected with 400 Bad Request."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            invalid_tenants = [
+                "../../etc",
+                "tenant/with/slashes",
+                "tenant;rm -rf",
+                "tenant with spaces",
+                "t" * 64,  # exceeds 63 characters
+            ]
+            for invalid_id in invalid_tenants:
+                resp = await client.post(
+                    "/v1/sessions/acquire",
+                    json={"workspace_id": "ws1"},
+                    headers={"X-Tenant-ID": invalid_id},
+                )
+                assert resp.status_code == 400, f"Expected 400 for invalid tenant_id '{invalid_id}', got {resp.status_code}"
+                assert "Invalid tenant_id" in resp.text
+
 

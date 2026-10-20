@@ -74,10 +74,21 @@ class DockerDriver(ContainerDriver):
         if settings.docker_network_internal:
             target_network = "sandbox-internal"
             try:
-                self.client.networks.get("sandbox-internal")
+                internal_net = self.client.networks.get("sandbox-internal")
             except Exception:
                 try:
-                    self.client.networks.create("sandbox-internal", internal=True, driver="bridge")
+                    internal_net = self.client.networks.create("sandbox-internal", internal=True, driver="bridge")
+                except Exception as e:
+                    raise RuntimeError(f"Failed to create internal Docker network 'sandbox-internal': {e}")
+
+            # Attach Squid egress proxy container to sandbox-internal network if present
+            for squid_name in ("sandbox-squid", "squid"):
+                try:
+                    squid_c = self.client.containers.get(squid_name)
+                    squid_c.reload()
+                    if "sandbox-internal" not in squid_c.attrs.get("NetworkSettings", {}).get("Networks", {}):
+                        internal_net.connect(squid_c)
+                    break
                 except Exception:
                     pass
 
@@ -117,12 +128,21 @@ class DockerDriver(ContainerDriver):
             container = self.client.containers.run(**kwargs)
 
         container.reload()
-        port_bindings = container.ports.get("5004/tcp")
-        if not port_bindings:
-            raise RuntimeError(f"Failed to retrieve port binding for container {container.id}")
-
-        host_port = port_bindings[0]["HostPort"]
-        endpoint = f"http://127.0.0.1:{host_port}"
+        if settings.docker_network_internal:
+            # Internal network disables host bridge port publishing.
+            # Connect directly to the container's IP on sandbox-internal.
+            net_settings = container.attrs.get("NetworkSettings", {})
+            ip = net_settings.get("Networks", {}).get("sandbox-internal", {}).get("IPAddress") or net_settings.get("IPAddress")
+            if not ip:
+                raise RuntimeError(f"Failed to retrieve internal IP address for container {container.id}")
+            host_port = None
+            endpoint = f"http://{ip}:5004"
+        else:
+            port_bindings = container.ports.get("5004/tcp")
+            if not port_bindings:
+                raise RuntimeError(f"Failed to retrieve port binding for container {container.id}")
+            host_port = port_bindings[0]["HostPort"]
+            endpoint = f"http://127.0.0.1:{host_port}"
 
         return SandboxInstance(
             sandbox_id=container.id[:12],
@@ -153,10 +173,15 @@ class DockerDriver(ContainerDriver):
 
     def _sync_get_endpoint(self, sandbox_id: str) -> str:
         container = self.client.containers.get(sandbox_id)
+        if settings.docker_network_internal:
+            net_settings = container.attrs.get("NetworkSettings", {})
+            ip = net_settings.get("Networks", {}).get("sandbox-internal", {}).get("IPAddress") or net_settings.get("IPAddress")
+            if ip:
+                return f"http://{ip}:5004"
         port_bindings = container.ports.get("5004/tcp")
         if port_bindings:
             return f"http://127.0.0.1:{port_bindings[0]['HostPort']}"
-        ip = container.attrs["NetworkSettings"]["IPAddress"]
+        ip = container.attrs.get("NetworkSettings", {}).get("IPAddress")
         return f"http://{ip}:5004"
 
     async def list_sandboxes(self, labels: Dict[str, str] = None) -> List[SandboxInstance]:
@@ -171,8 +196,13 @@ class DockerDriver(ContainerDriver):
         containers = self.client.containers.list(filters={"label": query_labels})
         instances = []
         for c in containers:
-            port_bindings = c.ports.get("5004/tcp")
-            endpoint = f"http://127.0.0.1:{port_bindings[0]['HostPort']}" if port_bindings else ""
+            if settings.docker_network_internal:
+                net_settings = c.attrs.get("NetworkSettings", {})
+                ip = net_settings.get("Networks", {}).get("sandbox-internal", {}).get("IPAddress") or net_settings.get("IPAddress")
+                endpoint = f"http://{ip}:5004" if ip else ""
+            else:
+                port_bindings = c.ports.get("5004/tcp")
+                endpoint = f"http://127.0.0.1:{port_bindings[0]['HostPort']}" if port_bindings else ""
             c_labels = c.labels or {}
             try:
                 created_ts = float(c_labels.get("sandbox.created_at", 0.0))

@@ -67,27 +67,29 @@ class LeaseBackend(ABC):
     ):
         pass
 
-    # Concurrency Lock APIs
+    # Concurrency Lock APIs (strictly scoped to tenant_id, workspace_id)
     @abstractmethod
     async def acquire_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: int
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         """
-        Atomically acquire or refresh workspace lock.
+        Atomically acquire or refresh workspace lock scoped to (tenant_id, workspace_id).
         Returns: (success, locked_by_session_id, expires_at)
         """
         pass
 
     @abstractmethod
-    async def release_workspace_lock(self, workspace_id: str, session_id: str) -> bool:
+    async def release_workspace_lock(self, workspace_id: str, session_id: str, tenant_id: str = "default") -> bool:
         pass
 
     @abstractmethod
-    async def refresh_workspace_lock(self, workspace_id: str, session_id: str, ttl_seconds: int) -> bool:
+    async def refresh_workspace_lock(
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
+    ) -> bool:
         pass
 
     @abstractmethod
-    async def get_workspace_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
+    async def get_workspace_lock(self, workspace_id: str, tenant_id: str = "default") -> Optional[Tuple[str, float]]:
         pass
 
     @abstractmethod
@@ -99,10 +101,19 @@ class LeaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         """
-        Registers or verifies tenant ownership of a workspace_id.
+        Registers or verifies tenant ownership of a workspace_id scoped to tenant_id.
         Returns: (is_owned_by_tenant, actual_owner_tenant_id)
+        """
+        pass
+
+    @abstractmethod
+    async def reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        """
+        Atomically checks and reserves a session slot under tenant quota to prevent check-then-act race conditions.
         """
         pass
 
@@ -154,18 +165,26 @@ class SQLiteLeaseBackend(LeaseBackend):
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workspace_locks (
-                    workspace_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    workspace_id TEXT NOT NULL,
                     session_id TEXT NOT NULL,
-                    expires_at REAL NOT NULL
+                    expires_at REAL NOT NULL,
+                    PRIMARY KEY (tenant_id, workspace_id)
                 )
                 """
             )
+            try:
+                conn.execute("ALTER TABLE workspace_locks ADD COLUMN tenant_id TEXT DEFAULT 'default'")
+            except Exception:
+                pass
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS workspaces (
-                    workspace_id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    workspace_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (tenant_id, workspace_id)
                 )
                 """
             )
@@ -318,75 +337,79 @@ class SQLiteLeaseBackend(LeaseBackend):
                 for r in rows
             ]
 
-    # Concurrency Lock Implementations
+    # Concurrency Lock Implementations (scoped to tenant_id and workspace_id)
     async def acquire_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: int
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         async with self._lock:
-            return await asyncio.to_thread(self._sync_acquire_lock, workspace_id, session_id, ttl_seconds)
+            return await asyncio.to_thread(self._sync_acquire_lock, workspace_id, session_id, ttl_seconds, tenant_id)
 
     def _sync_acquire_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: int
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         now = time.time()
         new_expires_at = now + ttl_seconds
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, expires_at FROM workspace_locks WHERE workspace_id = ?",
-                (workspace_id,),
+                "SELECT session_id, expires_at FROM workspace_locks WHERE tenant_id = ? AND workspace_id = ?",
+                (tenant_id, workspace_id),
             )
             row = cursor.fetchone()
             if row:
                 holder, exp = row[0], float(row[1])
                 if exp > now and holder != session_id:
-                    # Still held by another active session
+                    # Still held by another active session for this tenant
                     return False, holder, exp
 
             # Lock is either free, expired, or held by same session -> acquire/renew
             conn.execute(
-                "INSERT OR REPLACE INTO workspace_locks (workspace_id, session_id, expires_at) VALUES (?, ?, ?)",
-                (workspace_id, session_id, new_expires_at),
+                "INSERT OR REPLACE INTO workspace_locks (tenant_id, workspace_id, session_id, expires_at) VALUES (?, ?, ?, ?)",
+                (tenant_id, workspace_id, session_id, new_expires_at),
             )
             conn.commit()
             return True, session_id, new_expires_at
 
-    async def release_workspace_lock(self, workspace_id: str, session_id: str) -> bool:
+    async def release_workspace_lock(self, workspace_id: str, session_id: str, tenant_id: str = "default") -> bool:
         async with self._lock:
-            return await asyncio.to_thread(self._sync_release_lock, workspace_id, session_id)
+            return await asyncio.to_thread(self._sync_release_lock, workspace_id, session_id, tenant_id)
 
-    def _sync_release_lock(self, workspace_id: str, session_id: str) -> bool:
+    def _sync_release_lock(self, workspace_id: str, session_id: str, tenant_id: str = "default") -> bool:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "DELETE FROM workspace_locks WHERE workspace_id = ? AND session_id = ?",
-                (workspace_id, session_id),
+                "DELETE FROM workspace_locks WHERE tenant_id = ? AND workspace_id = ? AND session_id = ?",
+                (tenant_id, workspace_id, session_id),
             )
             conn.commit()
             return cursor.rowcount > 0
 
-    async def refresh_workspace_lock(self, workspace_id: str, session_id: str, ttl_seconds: int) -> bool:
+    async def refresh_workspace_lock(
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
+    ) -> bool:
         async with self._lock:
-            return await asyncio.to_thread(self._sync_refresh_lock, workspace_id, session_id, ttl_seconds)
+            return await asyncio.to_thread(self._sync_refresh_lock, workspace_id, session_id, ttl_seconds, tenant_id)
 
-    def _sync_refresh_lock(self, workspace_id: str, session_id: str, ttl_seconds: int) -> bool:
+    def _sync_refresh_lock(
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
+    ) -> bool:
         now = time.time()
         new_exp = now + ttl_seconds
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "UPDATE workspace_locks SET expires_at = ? WHERE workspace_id = ? AND session_id = ?",
-                (new_exp, workspace_id, session_id),
+                "UPDATE workspace_locks SET expires_at = ? WHERE tenant_id = ? AND workspace_id = ? AND session_id = ?",
+                (new_exp, tenant_id, workspace_id, session_id),
             )
             conn.commit()
             return cursor.rowcount > 0
 
-    async def get_workspace_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
-        return await asyncio.to_thread(self._sync_get_lock, workspace_id)
+    async def get_workspace_lock(self, workspace_id: str, tenant_id: str = "default") -> Optional[Tuple[str, float]]:
+        return await asyncio.to_thread(self._sync_get_lock, workspace_id, tenant_id)
 
-    def _sync_get_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
+    def _sync_get_lock(self, workspace_id: str, tenant_id: str = "default") -> Optional[Tuple[str, float]]:
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, expires_at FROM workspace_locks WHERE workspace_id = ? AND expires_at > ?",
-                (workspace_id, now),
+                "SELECT session_id, expires_at FROM workspace_locks WHERE tenant_id = ? AND workspace_id = ? AND expires_at > ?",
+                (tenant_id, workspace_id, now),
             )
             row = cursor.fetchone()
             if row:
@@ -419,22 +442,54 @@ class SQLiteLeaseBackend(LeaseBackend):
             row = cursor.fetchone()
             return row[0] if row else 0
 
-    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         return await asyncio.to_thread(self._sync_claim_workspace, workspace_id, tenant_id)
 
-    def _sync_claim_workspace(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+    def _sync_claim_workspace(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT tenant_id FROM workspaces WHERE workspace_id = ?", (workspace_id,))
-            row = cursor.fetchone()
-            if row:
-                return (row[0] == tenant_id, row[0])
             cursor.execute(
-                "INSERT INTO workspaces (workspace_id, tenant_id, created_at) VALUES (?, ?, ?)",
-                (workspace_id, tenant_id, time.time()),
+                "SELECT tenant_id FROM workspaces WHERE tenant_id = ? AND workspace_id = ?",
+                (tenant_id, workspace_id),
             )
-            conn.commit()
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute(
+                    "INSERT INTO workspaces (tenant_id, workspace_id, created_at) VALUES (?, ?, ?)",
+                    (tenant_id, workspace_id, time.time()),
+                )
+                conn.commit()
             return (True, tenant_id)
+
+    async def reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        return await asyncio.to_thread(self._sync_reserve_session_slot, tenant_id, max_concurrent, session_id, workspace_id)
+
+    def _sync_reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        if max_concurrent <= 0:
+            return True
+        now = time.time()
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "SELECT count(*) FROM leases WHERE tenant_id = ? AND status = 'active' AND expires_at > ?",
+                (tenant_id, now),
+            )
+            row = cursor.fetchone()
+            active = int(row[0]) if row else 0
+            if active >= max_concurrent:
+                return False
+            if session_id:
+                cursor.execute(
+                    "INSERT OR IGNORE INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id) "
+                    "VALUES (?, ?, 'pending', 'pending', ?, ?, 'active', '', ?)",
+                    (session_id, workspace_id or "", now, now + 120, tenant_id),
+                )
+            conn.commit()
+            return True
 
     async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
         return await asyncio.to_thread(self._sync_count_tenant_sessions, tenant_id)
@@ -551,9 +606,9 @@ class RedisLeaseBackend(LeaseBackend):
         return leases
 
     async def acquire_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: int
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
-        key = f"lock:workspace:{workspace_id}"
+        key = f"lock:workspace:{tenant_id}:{workspace_id}"
         now = time.time()
         existing = await self.redis.get(key)
         if existing:
@@ -568,7 +623,7 @@ class RedisLeaseBackend(LeaseBackend):
 
         ok = await self.redis.set(key, session_id, nx=True, ex=ttl_seconds)
         if ok:
-            await self.redis.sadd("workspace_locks:active", workspace_id)
+            await self.redis.sadd("workspace_locks:active", f"{tenant_id}:{workspace_id}")
             return True, session_id, now + ttl_seconds
 
         existing = await self.redis.get(key)
@@ -576,21 +631,23 @@ class RedisLeaseBackend(LeaseBackend):
         ttl_rem = await self.redis.ttl(key)
         return False, holder, now + max(0, ttl_rem)
 
-    async def release_workspace_lock(self, workspace_id: str, session_id: str) -> bool:
-        key = f"lock:workspace:{workspace_id}"
+    async def release_workspace_lock(self, workspace_id: str, session_id: str, tenant_id: str = "default") -> bool:
+        key = f"lock:workspace:{tenant_id}:{workspace_id}"
         existing = await self.redis.get(key)
         if not existing:
-            await self.redis.srem("workspace_locks:active", workspace_id)
+            await self.redis.srem("workspace_locks:active", f"{tenant_id}:{workspace_id}")
             return False
         holder = existing.decode("utf-8") if isinstance(existing, bytes) else str(existing)
         if holder == session_id:
             await self.redis.delete(key)
-            await self.redis.srem("workspace_locks:active", workspace_id)
+            await self.redis.srem("workspace_locks:active", f"{tenant_id}:{workspace_id}")
             return True
         return False
 
-    async def refresh_workspace_lock(self, workspace_id: str, session_id: str, ttl_seconds: int) -> bool:
-        key = f"lock:workspace:{workspace_id}"
+    async def refresh_workspace_lock(
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
+    ) -> bool:
+        key = f"lock:workspace:{tenant_id}:{workspace_id}"
         existing = await self.redis.get(key)
         if not existing:
             return False
@@ -600,8 +657,8 @@ class RedisLeaseBackend(LeaseBackend):
             return True
         return False
 
-    async def get_workspace_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
-        key = f"lock:workspace:{workspace_id}"
+    async def get_workspace_lock(self, workspace_id: str, tenant_id: str = "default") -> Optional[Tuple[str, float]]:
+        key = f"lock:workspace:{tenant_id}:{workspace_id}"
         existing = await self.redis.get(key)
         if not existing:
             return None
@@ -622,6 +679,28 @@ class RedisLeaseBackend(LeaseBackend):
     async def count_active_locks(self) -> int:
         await self.cleanup_expired_workspace_locks()
         return await self.redis.scard("workspace_locks:active")
+
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
+        return (True, tenant_id)
+
+    async def reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        if max_concurrent <= 0:
+            return True
+        active = await self.count_active_sessions_for_tenant(tenant_id)
+        if active >= max_concurrent:
+            return False
+        if session_id:
+            await self.create_or_renew_lease(
+                session_id=session_id,
+                workspace_id=workspace_id or "",
+                sandbox_id="pending",
+                endpoint="pending",
+                ttl_seconds=120,
+                tenant_id=tenant_id,
+            )
+        return True
 
 
 class PostgresLeaseBackend(LeaseBackend):
@@ -665,10 +744,12 @@ class PostgresLeaseBackend(LeaseBackend):
                 CREATE INDEX IF NOT EXISTS idx_leases_tenant_id ON leases(tenant_id);
 
                 CREATE TABLE IF NOT EXISTS workspace_locks (
-                    workspace_id VARCHAR(128) PRIMARY KEY,
+                    tenant_id VARCHAR(128) NOT NULL DEFAULT 'default',
+                    workspace_id VARCHAR(128) NOT NULL,
                     session_id VARCHAR(128) NOT NULL,
                     acquired_at DOUBLE PRECISION NOT NULL,
-                    expires_at DOUBLE PRECISION NOT NULL
+                    expires_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (tenant_id, workspace_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_workspace_locks_expires ON workspace_locks(expires_at);
 
@@ -683,11 +764,35 @@ class PostgresLeaseBackend(LeaseBackend):
                 CREATE INDEX IF NOT EXISTS idx_audit_session ON session_audit_logs(session_id);
 
                 CREATE TABLE IF NOT EXISTS workspaces (
-                    workspace_id VARCHAR(128) PRIMARY KEY,
                     tenant_id VARCHAR(128) NOT NULL,
-                    created_at DOUBLE PRECISION NOT NULL
+                    workspace_id VARCHAR(128) NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (tenant_id, workspace_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_workspaces_tenant ON workspaces(tenant_id);
+
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'workspace_locks' AND column_name = 'workspace_id') THEN
+                        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'workspace_locks' AND column_name = 'tenant_id') THEN
+                            ALTER TABLE workspace_locks ADD COLUMN tenant_id VARCHAR(128) NOT NULL DEFAULT 'default';
+                        END IF;
+                        BEGIN
+                            ALTER TABLE workspace_locks DROP CONSTRAINT IF EXISTS workspace_locks_pkey;
+                            ALTER TABLE workspace_locks ADD PRIMARY KEY (tenant_id, workspace_id);
+                        EXCEPTION WHEN OTHERS THEN
+                            NULL;
+                        END;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'workspaces' AND column_name = 'workspace_id') THEN
+                        BEGIN
+                            ALTER TABLE workspaces DROP CONSTRAINT IF EXISTS workspaces_pkey;
+                            ALTER TABLE workspaces ADD PRIMARY KEY (tenant_id, workspace_id);
+                        EXCEPTION WHEN OTHERS THEN
+                            NULL;
+                        END;
+                    END IF;
+                END $$;
 
                 CREATE TABLE IF NOT EXISTS engine_instances (
                     engine_id VARCHAR(128) PRIMARY KEY,
@@ -919,14 +1024,15 @@ class PostgresLeaseBackend(LeaseBackend):
             )
 
     async def acquire_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: int
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         now = time.time()
         expires_at = now + ttl_seconds
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT session_id, expires_at FROM workspace_locks WHERE workspace_id = $1 FOR UPDATE",
+                    "SELECT session_id, expires_at FROM workspace_locks WHERE tenant_id = $1 AND workspace_id = $2 FOR UPDATE",
+                    tenant_id,
                     workspace_id,
                 )
                 if row:
@@ -936,7 +1042,8 @@ class PostgresLeaseBackend(LeaseBackend):
                         return False, locked_by, current_expires
 
                     await conn.execute(
-                        "UPDATE workspace_locks SET session_id = $2, acquired_at = $3, expires_at = $4 WHERE workspace_id = $1",
+                        "UPDATE workspace_locks SET session_id = $3, acquired_at = $4, expires_at = $5 WHERE tenant_id = $1 AND workspace_id = $2",
+                        tenant_id,
                         workspace_id,
                         session_id,
                         now,
@@ -945,7 +1052,8 @@ class PostgresLeaseBackend(LeaseBackend):
                     return True, session_id, expires_at
                 else:
                     await conn.execute(
-                        "INSERT INTO workspace_locks (workspace_id, session_id, acquired_at, expires_at) VALUES ($1, $2, $3, $4)",
+                        "INSERT INTO workspace_locks (tenant_id, workspace_id, session_id, acquired_at, expires_at) VALUES ($1, $2, $3, $4, $5)",
+                        tenant_id,
                         workspace_id,
                         session_id,
                         now,
@@ -953,21 +1061,25 @@ class PostgresLeaseBackend(LeaseBackend):
                     )
                     return True, session_id, expires_at
 
-    async def release_workspace_lock(self, workspace_id: str, session_id: str) -> bool:
+    async def release_workspace_lock(self, workspace_id: str, session_id: str, tenant_id: str = "default") -> bool:
         async with self._pool.acquire() as conn:
             res = await conn.execute(
-                "DELETE FROM workspace_locks WHERE workspace_id = $1 AND session_id = $2",
+                "DELETE FROM workspace_locks WHERE tenant_id = $1 AND workspace_id = $2 AND session_id = $3",
+                tenant_id,
                 workspace_id,
                 session_id,
             )
             return res == "DELETE 1"
 
-    async def refresh_workspace_lock(self, workspace_id: str, session_id: str, ttl_seconds: int) -> bool:
+    async def refresh_workspace_lock(
+        self, workspace_id: str, session_id: str, ttl_seconds: int, tenant_id: str = "default"
+    ) -> bool:
         now = time.time()
         expires_at = now + ttl_seconds
         async with self._pool.acquire() as conn:
             res = await conn.execute(
-                "UPDATE workspace_locks SET expires_at = $3 WHERE workspace_id = $1 AND session_id = $2 AND expires_at >= $4",
+                "UPDATE workspace_locks SET expires_at = $4 WHERE tenant_id = $1 AND workspace_id = $2 AND session_id = $3 AND expires_at >= $5",
+                tenant_id,
                 workspace_id,
                 session_id,
                 expires_at,
@@ -975,11 +1087,12 @@ class PostgresLeaseBackend(LeaseBackend):
             )
             return res == "UPDATE 1"
 
-    async def get_workspace_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
+    async def get_workspace_lock(self, workspace_id: str, tenant_id: str = "default") -> Optional[Tuple[str, float]]:
         now = time.time()
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT session_id, expires_at FROM workspace_locks WHERE workspace_id = $1 AND expires_at >= $2",
+                "SELECT session_id, expires_at FROM workspace_locks WHERE tenant_id = $1 AND workspace_id = $2 AND expires_at >= $3",
+                tenant_id,
                 workspace_id,
                 now,
             )
@@ -1000,24 +1113,53 @@ class PostgresLeaseBackend(LeaseBackend):
             count = await conn.fetchval("SELECT COUNT(*) FROM workspace_locks WHERE expires_at >= $1", now)
             return int(count or 0)
 
-    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         now = time.time()
         async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO workspaces (tenant_id, workspace_id, created_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (tenant_id, workspace_id) DO NOTHING
+                """,
+                tenant_id,
+                workspace_id,
+                now,
+            )
+            return (True, tenant_id)
+
+    async def reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        if max_concurrent <= 0:
+            return True
+        async with self._pool.acquire() as conn:
             async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT tenant_id FROM workspaces WHERE workspace_id = $1 FOR UPDATE",
-                    workspace_id,
-                )
-                if row:
-                    owner = row["tenant_id"]
-                    return (owner == tenant_id, owner)
-                await conn.execute(
-                    "INSERT INTO workspaces (workspace_id, tenant_id, created_at) VALUES ($1, $2, $3) ON CONFLICT (workspace_id) DO NOTHING",
-                    workspace_id,
+                # Advisory transaction-level lock scoped to tenant_id hash
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext('tenant_quota:' || $1))", tenant_id)
+                now = time.time()
+                val = await conn.fetchval(
+                    "SELECT count(*) FROM leases WHERE tenant_id = $1 AND status = 'active' AND expires_at > $2",
                     tenant_id,
                     now,
                 )
-                return (True, tenant_id)
+                active = int(val or 0)
+                if active >= max_concurrent:
+                    return False
+                if session_id:
+                    await conn.execute(
+                        """
+                        INSERT INTO leases (session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id)
+                        VALUES ($1, $2, 'pending', 'pending', $3, $4, 'active', '', $5)
+                        ON CONFLICT (session_id) DO NOTHING
+                        """,
+                        session_id,
+                        workspace_id or "",
+                        now,
+                        now + 120,
+                        tenant_id,
+                    )
+                return True
 
     async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
         async with self._pool.acquire() as conn:
@@ -1174,22 +1316,26 @@ class LeaseManager:
 
     # Workspace Lock Operations
     async def acquire_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: Optional[int] = None
+        self, workspace_id: str, session_id: str, ttl_seconds: Optional[int] = None, tenant_id: str = "default"
     ) -> Tuple[bool, Optional[str], Optional[float]]:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
-        return await self._backend.acquire_workspace_lock(workspace_id, session_id, ttl)
+        return await self._backend.acquire_workspace_lock(workspace_id, session_id, ttl, tenant_id=tenant_id)
 
-    async def release_workspace_lock(self, workspace_id: str, session_id: str) -> bool:
-        return await self._backend.release_workspace_lock(workspace_id, session_id)
+    async def release_workspace_lock(
+        self, workspace_id: str, session_id: str, tenant_id: str = "default"
+    ) -> bool:
+        return await self._backend.release_workspace_lock(workspace_id, session_id, tenant_id=tenant_id)
 
     async def refresh_workspace_lock(
-        self, workspace_id: str, session_id: str, ttl_seconds: Optional[int] = None
+        self, workspace_id: str, session_id: str, ttl_seconds: Optional[int] = None, tenant_id: str = "default"
     ) -> bool:
         ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
-        return await self._backend.refresh_workspace_lock(workspace_id, session_id, ttl)
+        return await self._backend.refresh_workspace_lock(workspace_id, session_id, ttl, tenant_id=tenant_id)
 
-    async def get_workspace_lock(self, workspace_id: str) -> Optional[Tuple[str, float]]:
-        return await self._backend.get_workspace_lock(workspace_id)
+    async def get_workspace_lock(
+        self, workspace_id: str, tenant_id: str = "default"
+    ) -> Optional[Tuple[str, float]]:
+        return await self._backend.get_workspace_lock(workspace_id, tenant_id=tenant_id)
 
     async def cleanup_expired_workspace_locks(self) -> int:
         return await self._backend.cleanup_expired_workspace_locks()
@@ -1197,10 +1343,19 @@ class LeaseManager:
     async def count_active_locks(self) -> int:
         return await self._backend.count_active_locks()
 
-    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str) -> Tuple[bool, str]:
+    async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         if hasattr(self._backend, "claim_workspace_ownership"):
-            return await self._backend.claim_workspace_ownership(workspace_id, tenant_id)
+            return await self._backend.claim_workspace_ownership(workspace_id, tenant_id=tenant_id)
         return (True, tenant_id)
+
+    async def reserve_session_slot(
+        self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None
+    ) -> bool:
+        if hasattr(self._backend, "reserve_session_slot"):
+            return await self._backend.reserve_session_slot(
+                tenant_id, max_concurrent, session_id=session_id, workspace_id=workspace_id
+            )
+        return True
 
     async def count_active_sessions_for_tenant(self, tenant_id: str) -> int:
         if hasattr(self._backend, "count_active_sessions_for_tenant"):

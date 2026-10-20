@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import secrets
 from typing import List, Literal, Optional
 from pydantic import Field
@@ -80,11 +82,39 @@ class EngineSettings(BaseSettings):
 
         return self.default_local_postgres_url
 
+    def validate_tenant_keys_json(self):
+        """
+        Validates the format and syntax of SANDBOX_TENANT_KEYS_JSON.
+        Fails fast on malformed JSON or invalid tenant_id to prevent silent auth bypass.
+        """
+        if self.tenant_keys_json:
+            try:
+                mapping = json.loads(self.tenant_keys_json)
+            except Exception as e:
+                raise ValueError(
+                    f"Configuration error: SANDBOX_TENANT_KEYS_JSON contains malformed JSON: {e}"
+                )
+            if not isinstance(mapping, dict):
+                raise ValueError(
+                    "Configuration error: SANDBOX_TENANT_KEYS_JSON must be a JSON dictionary mapping tenant_id -> api_key"
+                )
+            for tid, key in mapping.items():
+                if not re.match(r"^[a-zA-Z0-9_\-\.]{1,63}\Z", str(tid)):
+                    raise ValueError(
+                        f"Configuration error: Invalid tenant_id '{tid}' in SANDBOX_TENANT_KEYS_JSON. "
+                        "Must match '^[a-zA-Z0-9_\\-\\.]+$' (max 63 chars)."
+                    )
+                if not isinstance(key, str) or not key.strip():
+                    raise ValueError(
+                        f"Configuration error: Invalid or empty API key for tenant '{tid}' in SANDBOX_TENANT_KEYS_JSON"
+                    )
+
     def validate_production_settings(self):
         """
         Validates that production environment has mandatory security configurations.
         Fails fast if auth, persistence, or encryption keys are missing, weak, or default placeholders.
         """
+        self.validate_tenant_keys_json()
         if self.environment.lower() in ("production", "prod"):
             # 1. API Key Validation
             if not self.api_key:
@@ -133,11 +163,30 @@ class EngineSettings(BaseSettings):
                     "Please set SANDBOX_POSTGRES_URL, POSTGRES_URL, or DATABASE_URL in your environment."
                 )
 
-            # 4. Driver & Runtime Isolation Validation
-            if self.driver == "docker" and self.docker_runtime == "runc" and not os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION"):
+            # 4. Tenant Keys Validation (Fail-fast on malformed JSON or weak keys)
+            if self.tenant_keys_json:
+                try:
+                    mapping = json.loads(self.tenant_keys_json)
+                    if not isinstance(mapping, dict):
+                        raise ValueError(
+                            "Production configuration error: SANDBOX_TENANT_KEYS_JSON must be a JSON dictionary mapping tenant_id -> api_key"
+                        )
+                    for tid, key in mapping.items():
+                        if not re.match(r"^[a-zA-Z0-9_\-\.]{1,63}\Z", str(tid)):
+                            raise ValueError(f"Invalid tenant_id '{tid}' in SANDBOX_TENANT_KEYS_JSON")
+                        if not isinstance(key, str) or len(key) < 32:
+                            raise ValueError(
+                                f"API key for tenant '{tid}' in SANDBOX_TENANT_KEYS_JSON is too short. Must be at least 32 characters."
+                            )
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Production configuration error: SANDBOX_TENANT_KEYS_JSON contains malformed JSON: {e}")
+
+            # 5. Driver & Runtime Isolation Validation
+            if self.driver == "docker" and not os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION"):
                 raise ValueError(
-                    "Production environment refuses to use standard 'runc' driver without strong isolation (gVisor 'runsc'). "
-                    "Set SANDBOX_DOCKER_RUNTIME=runsc or set ALLOW_INSECURE_DOCKER_PRODUCTION=1 for testing."
+                    "Production environment requires SANDBOX_DRIVER=k8s with strong container isolation (gVisor/Kata). "
+                    "Docker driver is supported for local development and testing only. "
+                    "Set SANDBOX_DRIVER=k8s or set ALLOW_INSECURE_DOCKER_PRODUCTION=1 to explicitly override."
                 )
 
     # Egress Proxy Configurations (Squid)

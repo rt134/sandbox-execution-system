@@ -16,7 +16,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:d8cfa1a260f85eb35dd0c9e6d081f2ec8c6c5ea3e3bb5ec49efce1338df29ad7
         env:
           POSTGRES_USER: sandbox
           POSTGRES_PASSWORD: sandbox
@@ -45,6 +45,18 @@ jobs:
         conda install -y pytest flake8
         pip install -e ./sandbox-client
         pip install -e ./sandbox-engine
+        pip install pip-audit
+
+    - name: Audit Python dependencies (pip-audit)
+      shell: bash -el {0}
+      run: |
+        pip-audit --desc on
+
+    - name: Validate Kubernetes manifests (kubeconform)
+      run: |
+        curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+        sudo mv kubeconform /usr/local/bin/
+        kubeconform -summary -strict -kubernetes-version 1.30.0 k8s/
 
     - name: Lint with flake8
       shell: bash -el {0}
@@ -57,6 +69,16 @@ jobs:
     - name: Build Docker sandbox image
       run: |
         docker build -t sandbox-base:latest daemon/
+
+    - name: Run Trivy vulnerability scanner on Docker sandbox image
+      uses: aquasecurity/trivy-action@0.24.0
+      with:
+        image-ref: 'sandbox-base:latest'
+        format: 'table'
+        exit-code: '0'
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL,HIGH'
 
     - name: Set up Go
       uses: actions/setup-go@v5

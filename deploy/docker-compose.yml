@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:d8cfa1a260f85eb35dd0c9e6d081f2ec8c6c5ea3e3bb5ec49efce1338df29ad7
     container_name: sandbox-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-sandbox}
@@ -20,7 +20,7 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:c221c5b4d7f57a06a2ff2d250f2495d909bb24c3df07e780a47eb38b97d259e8
     container_name: sandbox-redis
     ports:
       - "127.0.0.1:6379:6379"
@@ -38,7 +38,7 @@ services:
     restart: unless-stopped
 
   docker-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    image: tecnativa/docker-socket-proxy:0.1.1@sha256:90538a74e14f6b283c7ccfa89ef64ce49efda8b1398863f6a27e7ff5141c2c2f
     container_name: sandbox-docker-proxy
     environment:
       - CONTAINERS=1

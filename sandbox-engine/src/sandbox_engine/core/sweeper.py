@@ -80,7 +80,9 @@ class Sweeper:
                 logger.error(f"Failed to destroy sandbox {lease.sandbox_id}: {e}")
             finally:
                 if lease.workspace_id:
-                    await self.lease_manager.release_workspace_lock(lease.workspace_id, lease.session_id)
+                    await self.lease_manager.release_workspace_lock(
+                        lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
+                    )
                 await self.lease_manager.mark_expired(lease.session_id)
 
         # 2. Reconcile any orphaned workspace locks
@@ -96,7 +98,9 @@ class Sweeper:
                         logger.warning(f"🧹 [Sweeper] Detected dead/missing container '{lease.sandbox_id}' for active session '{lease.session_id}'. Reconciling...")
                         await self.lease_manager.mark_expired(lease.session_id)
                         if lease.workspace_id:
-                            await self.lease_manager.release_workspace_lock(lease.workspace_id, lease.session_id)
+                            await self.lease_manager.release_workspace_lock(
+                                lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
+                            )
                         SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
                 except Exception as e:
                     logger.error(f"Failed to check liveness of container {lease.sandbox_id}: {e}")

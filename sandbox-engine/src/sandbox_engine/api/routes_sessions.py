@@ -61,33 +61,48 @@ async def acquire_session(
     tenant_id = getattr(request.state, "tenant_id", "default")
 
     # Multi-Tenant Ownership Guard: Verify that workspace_id is owned by caller's tenant
-    is_owner, current_owner = await lease_mgr.claim_workspace_ownership(workspace_id, tenant_id)
+    is_owner, current_owner = await lease_mgr.claim_workspace_ownership(workspace_id, tenant_id=tenant_id)
     if not is_owner:
         raise HTTPException(
             status_code=403,
             detail=f"Access denied: workspace '{workspace_id}' is owned by another tenant",
         )
 
-    # Tenant Quota Guard: Check concurrent active session limit per tenant
+    # Tenant Quota Guard: Check concurrent active session limit per tenant atomically
     existing = await lease_mgr.get(session_id)
+    reserved_provisional = False
     if not (existing and existing.status == "active"):
-        active_count = await lease_mgr.count_active_sessions_for_tenant(tenant_id)
-        if active_count >= settings.max_concurrent_sessions_per_tenant:
+        reserved = await lease_mgr.reserve_session_slot(
+            tenant_id=tenant_id,
+            max_concurrent=settings.max_concurrent_sessions_per_tenant,
+            session_id=session_id,
+            workspace_id=workspace_id,
+        )
+        if not reserved:
             raise HTTPException(
                 status_code=429,
-                detail=f"Tenant concurrent session quota exceeded ({active_count}/{settings.max_concurrent_sessions_per_tenant} active sessions)",
+                detail=f"Tenant concurrent session quota exceeded ({settings.max_concurrent_sessions_per_tenant} active sessions max)",
             )
+        reserved_provisional = True
+
+    is_k8s = settings.driver.lower() == "k8s"
 
     # Security: Strict validation against directory traversal strictly scoped to tenant directory
-    workspace_dir = validate_workspace_id(workspace_id, settings.workspaces_root, tenant_id=tenant_id)
+    # Skip host directory creation on K8s to comply with readOnlyRootFilesystem
+    workspace_dir = validate_workspace_id(
+        workspace_id, settings.workspaces_root, tenant_id=tenant_id, create_host_dir=not is_k8s
+    )
 
     # Concurrency Lock: Ensure workspace is not held by another active session
     acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
         workspace_id=workspace_id,
         session_id=session_id,
         ttl_seconds=ttl,
+        tenant_id=tenant_id,
     )
     if not acquired:
+        if reserved_provisional:
+            await lease_mgr.release(session_id)
         remaining = max(0.0, expires_at - time.time()) if expires_at else 0.0
         raise HTTPException(
             status_code=409,
@@ -108,7 +123,7 @@ async def acquire_session(
             # Check if container is still responsive
             if await driver.healthcheck(existing.endpoint, auth_token=existing.auth_token):
                 await lease_mgr.heartbeat(session_id, ttl)
-                await lease_mgr.refresh_workspace_lock(workspace_id, session_id, ttl)
+                await lease_mgr.refresh_workspace_lock(workspace_id, session_id, ttl, tenant_id=tenant_id)
                 return SessionAcquireResponse(
                     session_id=existing.session_id,
                     workspace_id=existing.workspace_id,
@@ -118,7 +133,8 @@ async def acquire_session(
                     status="active",
                 )
 
-        os.makedirs(workspace_dir, exist_ok=True)
+        if not is_k8s:
+            os.makedirs(workspace_dir, exist_ok=True)
         auth_token = generate_daemon_token()
 
         # Spawn new stateful sandbox container with cgroup pids & disk quota enforcement
@@ -137,6 +153,8 @@ async def acquire_session(
         ready = await driver.healthcheck(instance.endpoint, auth_token=auth_token)
         if not ready:
             await driver.destroy_sandbox(instance.sandbox_id)
+            if reserved_provisional:
+                await lease_mgr.release(session_id)
             raise HTTPException(status_code=502, detail="Stateful sandbox failed healthcheck")
 
         lease = await lease_mgr.create_or_renew(
@@ -167,7 +185,9 @@ async def acquire_session(
     except HTTPException:
         raise
     except Exception as e:
-        await lease_mgr.release_workspace_lock(workspace_id, session_id)
+        await lease_mgr.release_workspace_lock(workspace_id, session_id, tenant_id=tenant_id)
+        if reserved_provisional:
+            await lease_mgr.release(session_id)
         raise HTTPException(status_code=500, detail=f"Failed to acquire session: {e}")
 
 
@@ -192,7 +212,7 @@ async def session_heartbeat(
         raise HTTPException(status_code=404, detail="Session not found or expired")
 
     if lease.workspace_id:
-        await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id, ttl)
+        await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id, ttl, tenant_id=tenant_id)
 
     return HeartbeatResponse(
         session_id=lease.session_id,
@@ -218,7 +238,7 @@ async def release_session(
 
     await lease_mgr.release(session_id)
     if lease.workspace_id:
-        await lease_mgr.release_workspace_lock(lease.workspace_id, session_id)
+        await lease_mgr.release_workspace_lock(lease.workspace_id, session_id, tenant_id=tenant_id)
 
     if lease.sandbox_id:
         await driver.destroy_sandbox(lease.sandbox_id)
