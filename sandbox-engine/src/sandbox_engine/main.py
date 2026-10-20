@@ -12,6 +12,7 @@ from .api.routes_ws import router as ws_router
 from .config import settings
 from .core.lease_manager import LeaseManager
 from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
+from .core.rate_limiter import rate_limiter
 from .core.security import verify_api_key
 from .core.sweeper import Sweeper
 from .core.warm_pool import WarmPoolManager

@@ -1389,6 +1389,10 @@ class LeaseManager:
     def __init__(self, backend: Optional[LeaseBackend] = None):
         self._backend = backend
 
+    @property
+    def backend(self) -> Optional[LeaseBackend]:
+        return self._backend
+
     async def initialize(self):
         if self._backend is not None:
             return
