@@ -96,8 +96,9 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	cmd.Stdin = bytes.NewReader(payloadBytes)
-	stdoutBuf := newCappedBuffer(maxOutputBytes)
-	stderrBuf := newCappedBuffer(maxOutputBytes)
+	shared := newSharedOutputCap(maxOutputBytes)
+	stdoutBuf := newCappedBuffer(shared)
+	stderrBuf := newCappedBuffer(shared)
 	cmd.Stdout = stdoutBuf
 	cmd.Stderr = stderrBuf
 
