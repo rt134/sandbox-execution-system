@@ -71,7 +71,7 @@ jobs:
         docker build -t sandbox-base:latest daemon/
 
     - name: Run Trivy vulnerability scanner on Docker sandbox image
-      uses: aquasecurity/trivy-action@0.24.0
+      uses: aquasecurity/trivy-action@v0.36.0
       with:
         image-ref: 'sandbox-base:latest'
         format: 'table'
