@@ -13,6 +13,8 @@ import pytest
 from sandbox_engine.main import app
 from sandbox_client import SandboxClient, create_agent_tools
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_e2e_full_workflow():

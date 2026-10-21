@@ -11,6 +11,7 @@ def test_driver_subclasses():
     assert issubclass(KubernetesDriver, ContainerDriver)
 
 
+@pytest.mark.integration
 def test_get_driver_factory():
     original = settings.driver
     try:

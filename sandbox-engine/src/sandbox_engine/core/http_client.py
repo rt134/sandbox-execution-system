@@ -42,13 +42,14 @@ async def stream_response_bytes(
     url: str,
     *,
     json: Optional[dict] = None,
+    params: Optional[dict] = None,
     headers: Optional[Dict[str, str]] = None,
     max_bytes: Optional[int] = None,
 ) -> AsyncIterator[bytes]:
     cap = max_bytes if max_bytes is not None else settings.max_stream_response_bytes
     total = 0
     async with httpx.AsyncClient(timeout=None, limits=DEFAULT_LIMITS) as client:
-        async with client.stream(method, url, json=json, headers=headers) as resp:
+        async with client.stream(method, url, json=json, params=params, headers=headers) as resp:
             async for chunk in resp.aiter_bytes():
                 total += len(chunk)
                 if total > cap:

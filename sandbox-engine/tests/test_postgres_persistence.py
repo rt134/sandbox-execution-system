@@ -241,11 +241,28 @@ def test_workspace_id_newline_rejected():
     assert "Invalid workspace_id" in exc_info.value.detail
 
 
-def test_production_mode_refuses_to_start_without_api_key(monkeypatch):
-    """Verify that production mode refuses to start without SANDBOX_API_KEY."""
+def test_production_mode_refuses_to_start_without_tenant_keys(monkeypatch):
+    """Verify that production mode refuses to start without SANDBOX_TENANT_KEYS_JSON."""
     monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "api_key", None)
+    monkeypatch.setattr(settings, "tenant_keys_json", None)
+    monkeypatch.setattr(settings, "api_key", "a" * 32)
+    monkeypatch.setattr(settings, "encryption_key", "b" * 32)
     monkeypatch.setattr(settings, "postgres_url", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setattr(settings, "driver", "k8s")
+
+    with pytest.raises(ValueError, match="SANDBOX_TENANT_KEYS_JSON"):
+        settings.validate_production_settings()
+
+
+def test_production_mode_refuses_to_start_without_api_key(monkeypatch):
+    """Verify that production mode refuses to start without SANDBOX_API_KEY when tenant keys exist."""
+    tenant_keys = '{"prodtenant": "' + ("c" * 32) + '"}'
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "tenant_keys_json", tenant_keys)
+    monkeypatch.setattr(settings, "api_key", None)
+    monkeypatch.setattr(settings, "encryption_key", "d" * 32)
+    monkeypatch.setattr(settings, "postgres_url", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setattr(settings, "driver", "k8s")
 
     with pytest.raises(ValueError, match="Production environment requires SANDBOX_API_KEY"):
         settings.validate_production_settings()

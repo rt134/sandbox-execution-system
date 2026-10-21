@@ -253,7 +253,7 @@ async def test_dead_container_sweeper_reconciliation():
     sandbox_id = "sbx_will_die"
 
     await lease_mgr.claim_workspace_ownership(ws_id, "tenant_a")
-    await lease_mgr.acquire_workspace_lock(ws_id, session_id, ttl_seconds=300)
+    await lease_mgr.acquire_workspace_lock(ws_id, session_id, ttl_seconds=300, tenant_id="tenant_a")
     await lease_mgr.create_or_renew(
         session_id=session_id,
         workspace_id=ws_id,
@@ -279,7 +279,9 @@ async def test_dead_container_sweeper_reconciliation():
     assert lease is None or lease.status == "expired", "Dead container's lease must be expired!"
 
     # Now another session can acquire the workspace lock immediately without 409 conflict
-    acquired, locked_by, _ = await lease_mgr.acquire_workspace_lock(ws_id, "sess_new", ttl_seconds=60)
+    acquired, locked_by, _ = await lease_mgr.acquire_workspace_lock(
+        ws_id, "sess_new", ttl_seconds=60, tenant_id="tenant_a"
+    )
     assert acquired is True, f"Workspace lock should be released after dead container reconciliation! Locked by: {locked_by}"
 
     await lease_mgr.close()

@@ -12,6 +12,8 @@ import pytest
 from sandbox_engine.main import app
 from sandbox_engine.models import SessionAcquireRequest
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 async def test_stateful_workspace_persistence():

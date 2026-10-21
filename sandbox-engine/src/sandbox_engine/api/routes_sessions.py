@@ -293,7 +293,7 @@ async def release_session(
 # Proxied Session APIs (Auto-Heartbeat & Keepalive on each interaction)
 # =========================================================================
 
-async def _get_active_session(session_id: str, lease_mgr: LeaseManager, tenant_id: str = "default") -> tuple[str, Optional[str]]:
+async def _get_active_session(session_id: str, lease_mgr: LeaseManager, tenant_id: str = "default") -> tuple[str, str | None]:
     validate_session_id(session_id)
     lease = await lease_mgr.get(session_id)
     if not lease or lease.status != "active":
@@ -302,7 +302,9 @@ async def _get_active_session(session_id: str, lease_mgr: LeaseManager, tenant_i
         raise HTTPException(status_code=403, detail="Access denied: session belongs to another tenant")
     await lease_mgr.heartbeat(session_id)  # Auto-extend lease
     if lease.workspace_id:
-        await lease_mgr.refresh_workspace_lock(lease.workspace_id, session_id)
+        await lease_mgr.refresh_workspace_lock(
+            lease.workspace_id, session_id, tenant_id=tenant_id
+        )
     return lease.endpoint, lease.auth_token
 
 

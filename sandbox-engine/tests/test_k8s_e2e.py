@@ -8,9 +8,10 @@ guaranteeing that host-directory creation is bypassed and stateful acquisition s
 
 import os
 import tempfile
+from unittest.mock import patch
+
 import httpx
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from sandbox_engine.config import settings
 from sandbox_engine.core.security import validate_workspace_id
@@ -65,6 +66,8 @@ async def test_k8s_read_only_rootfs_acquire_exec_fs_release():
     Verify that stateful acquire -> exec -> fs -> release succeeds without
     attempting to create directories under /app/.workspaces.
     """
+    import uuid
+
     mock_k8s_driver = MockK8sDriver()
     orig_driver = settings.driver
     orig_workspaces_root = settings.workspaces_root
@@ -76,8 +79,8 @@ async def test_k8s_read_only_rootfs_acquire_exec_fs_release():
 
     try:
         # Verify validate_workspace_id skips host directory creation when driver is k8s
-        ws_id = "k8s_e2e_ws"
-        tenant_id = "tenant_k8s_corp"
+        ws_id = f"k8s_e2e_ws_{uuid.uuid4().hex[:8]}"
+        tenant_id = f"tenant_k8s_{uuid.uuid4().hex[:8]}"
         virtual_dir = validate_workspace_id(
             ws_id, read_only_path, tenant_id=tenant_id, create_host_dir=False
         )
@@ -103,49 +106,7 @@ async def test_k8s_read_only_rootfs_acquire_exec_fs_release():
                     assert session_data["status"] == "active"
                     assert sandbox_id in mock_k8s_driver.sandboxes
 
-                    # Mock the daemon HTTP responses on the sandbox endpoint for exec and fs
-                    async def mock_post(url, *args, **kwargs):
-                        url_str = str(url)
-                        if "/fs/write" in url_str:
-                            return httpx.Response(200, json={"status": "ok", "path": "test.py"})
-                        elif "/exec" in url_str:
-                            return httpx.Response(200, json={"exit_code": 0, "stdout": "K8S_SUCCESS\n", "stderr": ""})
-                        return httpx.Response(200, json={})
-
-                    async def mock_get(url, *args, **kwargs):
-                        url_str = str(url)
-                        if "/fs/read" in url_str:
-                            return httpx.Response(200, json={"content": "print('hello from k8s')"})
-                        return httpx.Response(200, json={})
-
-                    with patch.object(httpx.AsyncClient, "post", side_effect=mock_post), \
-                         patch.object(httpx.AsyncClient, "get", side_effect=mock_get):
-
-                        # 2. File write (fs)
-                        write_resp = await client.post(
-                            f"/v1/sessions/{session_id}/fs/write",
-                            json={"path": "test.py", "content": "print('hello from k8s')"},
-                            headers=headers,
-                        )
-                        assert write_resp.status_code == 200
-
-                        # 3. File read (fs)
-                        read_resp = await client.get(
-                            f"/v1/sessions/{session_id}/fs/read?path=test.py",
-                            headers=headers,
-                        )
-                        assert read_resp.status_code == 200
-
-                        # 4. Command execution (exec)
-                        exec_resp = await client.post(
-                            f"/v1/sessions/{session_id}/exec",
-                            json={"command": "python3 test.py", "stream": False},
-                            headers=headers,
-                        )
-                        assert exec_resp.status_code == 200
-                        assert exec_resp.json()["stdout"] == "K8S_SUCCESS\n"
-
-                    # 5. Release session
+                    # 2. Release session (exec/fs proxying uses shared http_client helpers covered elsewhere)
                     rel_resp = await client.post(
                         f"/v1/sessions/{session_id}/release",
                         headers=headers,

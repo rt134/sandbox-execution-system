@@ -331,7 +331,7 @@ class SQLiteLeaseBackend(LeaseBackend):
     def _sync_get(self, session_id: str) -> Optional[LeaseRecord]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE session_id = ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE session_id = ?",
                 (session_id,),
             )
             row = cursor.fetchone()
@@ -345,6 +345,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     expires_at=row[5],
                     status=row[6],
                     auth_token=row[7] if len(row) > 7 else None,
+                    tenant_id=row[8] if len(row) > 8 and row[8] else "default",
                 )
         return None
 
@@ -373,7 +374,7 @@ class SQLiteLeaseBackend(LeaseBackend):
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at < ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at < ?",
                 (now,),
             )
             rows = cursor.fetchall()
@@ -387,6 +388,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     expires_at=r[5],
                     status=r[6],
                     auth_token=r[7] if len(r) > 7 else None,
+                    tenant_id=r[8] if len(r) > 8 and r[8] else "default",
                 )
                 for r in rows
             ]
@@ -398,7 +400,7 @@ class SQLiteLeaseBackend(LeaseBackend):
         now = time.time()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token FROM leases WHERE status = 'active' AND expires_at >= ?",
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at >= ?",
                 (now,),
             )
             rows = cursor.fetchall()
@@ -412,6 +414,7 @@ class SQLiteLeaseBackend(LeaseBackend):
                     expires_at=r[5],
                     status=r[6],
                     auth_token=r[7] if len(r) > 7 else None,
+                    tenant_id=r[8] if len(r) > 8 and r[8] else "default",
                 )
                 for r in rows
             ]
