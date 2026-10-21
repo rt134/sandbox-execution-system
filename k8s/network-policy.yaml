@@ -23,18 +23,8 @@ spec:
         - protocol: TCP
           port: 5004
   egress:
-    # 1. Allow CoreDNS for domain resolution
-    - to:
-        - namespaceSelector: {}
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    # 2. Allow Egress ONLY to the Squid / Corporate Outbound Proxy
+    # Sandboxes resolve via Squid proxy env; no direct DNS egress.
+    # Allow Egress ONLY to the Squid outbound proxy
     - to:
         - namespaceSelector:
             matchLabels:

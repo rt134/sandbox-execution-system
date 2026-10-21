@@ -128,3 +128,16 @@ Internal cluster applications connect to:
 ```python
 client = SandboxClient(base_url="http://sandbox-engine.sandboxes.svc.cluster.local:8080")
 ```
+
+---
+
+## Deploy requirements (operator-owned)
+
+These controls are not fully enforceable from this repository alone:
+
+- **Host firewall**: `DOCKER-USER` iptables drops for link-local/metadata (`169.254.0.0/16`), RFC1918, CGNAT (`100.64.0.0/10`), and cloud-specific endpoints when using the Docker dev driver on bare metal.
+- **Rootless dockerd** for any non-Kubernetes sandbox hosts.
+- **Hard workspace quotas**: XFS project quotas on Docker bind mounts, or a StorageClass/CSI driver that enforces PVC capacity (local-path and hostPath typically do not).
+- **Supply chain**: digest-pinned base images, Python lockfile, Go module checksums, SBOM generation, and image signing in CI.
+- **TLS**: Ingress or service mesh TLS in front of the engine API so tenant credentials are not sent in cleartext.
+- **Sandbox node kubelet**: `podPidsLimit=256` on the dedicated sandbox node pool.

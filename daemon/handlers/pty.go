@@ -49,7 +49,7 @@ func PTYHandler(w http.ResponseWriter, r *http.Request) {
 
 	cmd := exec.Command(shell)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = append(scrubInheritedEnv(), "TERM=xterm-256color")
 
 	// Start PTY with default 80x24 window size
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{

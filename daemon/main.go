@@ -41,8 +41,6 @@ func authMiddleware(next http.Handler) http.Handler {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
 				token = strings.TrimPrefix(authHeader, "Bearer ")
-			} else if qToken := r.URL.Query().Get("token"); qToken != "" {
-				token = qToken
 			}
 
 			if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) != 1 {
@@ -56,6 +54,10 @@ func authMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	if os.Getenv("SHELLCTL_AUTH_TOKEN") == "" {
+		log.Fatal("SHELLCTL_AUTH_TOKEN must be set; refusing to start without daemon authentication")
+	}
+
 	port := os.Getenv("SHELLCTL_PORT")
 	if port == "" {
 		port = "5004"

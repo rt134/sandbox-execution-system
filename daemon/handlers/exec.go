@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -96,8 +97,7 @@ func ExecHandler(w http.ResponseWriter, r *http.Request) {
 	// Forcibly close I/O pipes after 250ms delay if children hang on stdout/stderr
 	cmd.WaitDelay = 250 * time.Millisecond
 
-	// Environment variables
-	cmd.Env = os.Environ()
+	cmd.Env = scrubInheritedEnv()
 	for k, v := range req.Env {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 	}
@@ -210,22 +210,45 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 }
 
 type cappedBuffer struct {
-	limit int
-	buf   bytes.Buffer
+	shared *sharedOutputCap
+	buf    bytes.Buffer
 }
 
-func newCappedBuffer(limit int) *cappedBuffer {
-	return &cappedBuffer{limit: limit}
+type sharedOutputCap struct {
+	limit int
+	used  int
+}
+
+func newSharedOutputCap(limit int) *sharedOutputCap {
+	return &sharedOutputCap{limit: limit}
+}
+
+func (s *sharedOutputCap) write(p []byte, dest *bytes.Buffer) (truncated bool) {
+	if s.used >= s.limit {
+		return true
+	}
+	room := s.limit - s.used
+	toWrite := len(p)
+	if toWrite > room {
+		toWrite = room
+		truncated = true
+	}
+	if toWrite > 0 {
+		dest.Write(p[:toWrite])
+		s.used += toWrite
+	}
+	if len(p) > toWrite {
+		truncated = true
+	}
+	return truncated
+}
+
+func newCappedBuffer(shared *sharedOutputCap) *cappedBuffer {
+	return &cappedBuffer{shared: shared}
 }
 
 func (c *cappedBuffer) Write(p []byte) (n int, err error) {
-	if c.buf.Len() < c.limit {
-		toWrite := c.limit - c.buf.Len()
-		if len(p) < toWrite {
-			toWrite = len(p)
-		}
-		c.buf.Write(p[:toWrite])
-	}
+	c.shared.write(p, &c.buf)
 	return len(p), nil
 }
 
@@ -241,9 +264,21 @@ func (c *cappedBuffer) Len() int {
 	return c.buf.Len()
 }
 
+func scrubInheritedEnv() []string {
+	out := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "SHELLCTL_AUTH_TOKEN=") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Context, start time.Time, timeoutSec float64) {
-	stdoutBuf := newCappedBuffer(maxOutputBytes)
-	stderrBuf := newCappedBuffer(maxOutputBytes)
+	shared := newSharedOutputCap(maxOutputBytes)
+	stdoutBuf := newCappedBuffer(shared)
+	stderrBuf := newCappedBuffer(shared)
 	cmd.Stdout = stdoutBuf
 	cmd.Stderr = stderrBuf
 
@@ -252,6 +287,7 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 
 	exitCode := 0
 	var errStr *string
+	truncated := shared.used >= shared.limit
 
 	if ctx.Err() == context.DeadlineExceeded {
 		if cmd.Process != nil && cmd.Process.Pid > 0 {
@@ -270,6 +306,12 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 		errStr = &s
 	}
 
+	if truncated {
+		exitCode = 1
+		msg := fmt.Sprintf("Combined stdout/stderr exceeded %d byte limit", maxOutputBytes)
+		errStr = &msg
+	}
+
 	resp := ExecFullResponse{
 		Stdout:     stdoutBuf.String(),
 		Stderr:     stderrBuf.String(),
@@ -279,6 +321,10 @@ func handleBufferedExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Contex
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	if truncated {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }

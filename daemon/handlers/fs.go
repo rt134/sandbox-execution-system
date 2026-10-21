@@ -60,7 +60,15 @@ func getWorkspaceDiskQuota() int64 {
 	return int64(quotaMB) * 1024 * 1024
 }
 
+var (
+	usageCacheBytes int64
+	usageCacheAt    time.Time
+)
+
 func getWorkspaceDiskUsage() int64 {
+	if time.Since(usageCacheAt) < 2*time.Second {
+		return usageCacheBytes
+	}
 	root := getWorkspaceRoot()
 	var totalSize int64
 	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
@@ -69,6 +77,8 @@ func getWorkspaceDiskUsage() int64 {
 		}
 		return nil
 	})
+	usageCacheBytes = totalSize
+	usageCacheAt = time.Now()
 	return totalSize
 }
 

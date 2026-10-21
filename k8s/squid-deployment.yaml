@@ -7,21 +7,33 @@ data:
   squid.conf: |
     http_port 3128
 
-    # Safe ports
     acl SSL_ports port 443
-    acl Safe_ports port 80          # http
-    acl Safe_ports port 443         # https
+    acl Safe_ports port 80
+    acl Safe_ports port 443
     http_access deny !Safe_ports
     http_access deny CONNECT !SSL_ports
 
-    # Whitelist allowed package registries & public APIs
+    acl cloud_metadata dst 169.254.169.254/32
+    acl cloud_metadata dst 169.254.0.0/16
+    acl loopback_net dst 127.0.0.0/8
+    acl rfc1918_class_a dst 10.0.0.0/8
+    acl rfc1918_class_b dst 172.16.0.0/12
+    acl rfc1918_class_c dst 192.168.0.0/16
+    acl cgnat dst 100.64.0.0/10
+    acl alibaba_meta dst 100.100.100.200/32
+    acl azure_wire dst 168.63.129.16/32
+    http_access deny cloud_metadata
+    http_access deny loopback_net
+    http_access deny rfc1918_class_a
+    http_access deny rfc1918_class_b
+    http_access deny rfc1918_class_c
+    http_access deny cgnat
+    http_access deny alibaba_meta
+    http_access deny azure_wire
+
     acl allowed_domains dstdomain .pypi.org .pythonhosted.org .npmjs.org .npmjs.com .registry.npmjs.org .github.com .huggingface.co
     http_access allow allowed_domains
-
-    # Deny all other egress traffic by default
     http_access deny all
-
-    # Disable proxy caching for pure filtering
     cache deny all
 ---
 apiVersion: apps/v1
@@ -41,16 +53,32 @@ spec:
       labels:
         app.kubernetes.io/name: squid-proxy
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: squid
           image: ubuntu/squid:5.2-22.04_beta@sha256:8b4566d582f3c7333a59d8aa370e7a2df255a5b51239c0716616334a1599557a
           ports:
             - containerPort: 3128
               name: proxy
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: config
               mountPath: /etc/squid/squid.conf
               subPath: squid.conf
+            - name: squid-cache
+              mountPath: /var/spool/squid
+            - name: squid-run
+              mountPath: /run
           resources:
             requests:
               cpu: "100m"
@@ -62,6 +90,10 @@ spec:
         - name: config
           configMap:
             name: squid-config
+        - name: squid-cache
+          emptyDir: {}
+        - name: squid-run
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

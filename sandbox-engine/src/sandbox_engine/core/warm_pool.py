@@ -29,6 +29,7 @@ class WarmPoolManager:
         self._active_spawns: int = 0
         self._running: bool = False
         self._all_pool_ids: Set[str] = set()
+        self._background_tasks: Set[asyncio.Task] = set()
         # Cap concurrent Docker/K8s launches to avoid socket / API server starvation
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_spawns)
 
@@ -71,11 +72,15 @@ class WarmPoolManager:
             return
         needed = self.target_size - (self.queue.qsize() + self._active_spawns)
         for _ in range(max(0, needed)):
-            asyncio.create_task(self._spawn_warm_instance())
+            self._track_task(asyncio.create_task(self._spawn_warm_instance()))
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def trigger_recycle(self, instance: SandboxInstance):
         """Asynchronously destroy a consumed sandbox in the background."""
-        asyncio.create_task(self._recycle_worker(instance))
+        self._track_task(asyncio.create_task(self._recycle_worker(instance)))
 
     async def _recycle_worker(self, instance: SandboxInstance):
         try:

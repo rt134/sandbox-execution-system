@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-
 from .api.routes_sessions import router as sessions_router
 from .api.routes_stateless import router as stateless_router
 from .api.routes_ws import router as ws_router
 from .config import settings
+from .core.admission import acquire_in_flight, release_in_flight
 from .core.lease_manager import LeaseManager
-from .core.metrics import ACTIVE_SESSIONS, WARM_POOL_AVAILABLE, WORKSPACE_LOCKS_ACTIVE
 from .core.rate_limiter import rate_limiter
-from .core.security import verify_api_key
 from .core.sweeper import Sweeper
 from .core.warm_pool import WarmPoolManager
 from .drivers import get_driver
@@ -53,8 +50,14 @@ async def lifespan(app: FastAPI):
     # Wire distributed rate limiter
     if hasattr(lease_mgr.backend, "_pool") and lease_mgr.backend._pool:
         rate_limiter.set_pool(lease_mgr.backend._pool)
+        await rate_limiter.ensure_pg_schema()
     elif hasattr(lease_mgr.backend, "redis") and lease_mgr.backend.redis:
         rate_limiter.set_redis(lease_mgr.backend.redis)
+
+    if settings.enable_prometheus_metrics:
+        from prometheus_client import start_http_server
+
+        start_http_server(settings.metrics_port)
 
     app.state.driver = driver
     app.state.lease_manager = lease_mgr
@@ -70,11 +73,14 @@ async def lifespan(app: FastAPI):
     await lease_mgr.close()
 
 
+_is_prod = settings.environment.lower() in ("production", "prod")
 app = FastAPI(
     title="Sandbox Execution Engine",
     description="Unified execution engine for stateless code and stateful agent sandboxes",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url=None if _is_prod else "/docs",
+    openapi_url=None if _is_prod else "/openapi.json",
 )
 
 # Secure CORS Middleware: Never pair wildcard origins with credentials
@@ -90,7 +96,17 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def limit_request_size(request: Request, call_next):
+async def admission_and_size_limits(request: Request, call_next):
+    if request.url.path.startswith("/v1/"):
+        await acquire_in_flight()
+        try:
+            return await _limit_request_size(request, call_next)
+        finally:
+            await release_in_flight()
+    return await _limit_request_size(request, call_next)
+
+
+async def _limit_request_size(request: Request, call_next):
     """Enforce strict request body size limit (25MB) including chunked streams to prevent memory exhaustion attacks."""
     content_length = request.headers.get("content-length")
     if content_length:
@@ -115,9 +131,10 @@ async def limit_request_size(request: Request, call_next):
                 body_chunk = msg.get("body", b"")
                 received_bytes += len(body_chunk)
                 if received_bytes > settings.max_request_size_bytes:
-                    raise HTTPException(
+                    return Response(
+                        content='{"detail":"Request entity too large: streaming payload exceeds 25MB limit"}',
                         status_code=413,
-                        detail="Request entity too large: streaming payload exceeds 25MB limit",
+                        media_type="application/json",
                     )
             return msg
 
@@ -142,13 +159,11 @@ async def healthz():
     """System health check: returns component status without requiring tenant auth."""
     driver_name = getattr(app.state, "driver", None).__class__.__name__ if hasattr(app.state, "driver") else "unknown"
     pool_size = app.state.warm_pool.queue.qsize() if hasattr(app.state, "warm_pool") else 0
-    active_leases = len(await app.state.lease_manager.list_active()) if hasattr(app.state, "lease_manager") else 0
     return {
         "status": "healthy",
         "driver": driver_name,
         "configured_driver": settings.driver,
         "warm_pool_available": pool_size,
-        "active_leases": active_leases,
     }
 
 
@@ -165,28 +180,19 @@ async def readyz():
     if not db_ready:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database ledger unreachable")
 
-    # Verify warm pool has ready instances or driver is responsive
     pool_size = app.state.warm_pool.queue.qsize()
+    warm_ready = pool_size > 0 or settings.driver == "k8s"
+    if not warm_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Warm pool empty and no sandboxes ready",
+        )
     return {
         "status": "ready",
         "database": "ready",
-        "warm_pool_ready": pool_size > 0,
+        "warm_pool_ready": warm_ready,
         "warm_pool_size": pool_size,
     }
-
-
-@app.get("/metrics", tags=["Observability"], dependencies=[Depends(verify_api_key)])
-async def get_metrics():
-    """Prometheus metrics endpoint for scraping."""
-    if hasattr(app.state, "warm_pool") and app.state.warm_pool:
-        WARM_POOL_AVAILABLE.set(app.state.warm_pool.queue.qsize())
-    if hasattr(app.state, "lease_manager") and app.state.lease_manager:
-        active_leases = await app.state.lease_manager.list_active()
-        ACTIVE_SESSIONS.set(len(active_leases))
-        active_locks = await app.state.lease_manager.count_active_locks()
-        WORKSPACE_LOCKS_ACTIVE.set(active_locks)
-
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":

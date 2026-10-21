@@ -6,7 +6,7 @@ import os
 import re
 import secrets
 from typing import Optional
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -53,10 +53,20 @@ def validate_session_id(session_id: str) -> str:
     return session_id
 
 
-def _get_fernet() -> Fernet:
-    """Derives a deterministic 32-byte urlsafe Fernet key from settings.encryption_key."""
-    key_hash = hashlib.sha256(settings.encryption_key.encode("utf-8")).digest()
+def _fernet_from_secret(secret: str) -> Fernet:
+    key_hash = hashlib.sha256(secret.encode("utf-8")).digest()
     return Fernet(base64.urlsafe_b64encode(key_hash))
+
+
+def _get_fernet() -> MultiFernet | Fernet:
+    keys = [settings.encryption_key]
+    extra = os.environ.get("SANDBOX_ENCRYPTION_KEYS", "")
+    if extra.strip():
+        keys.extend(k.strip() for k in extra.split(",") if k.strip())
+    fernets = [_fernet_from_secret(k) for k in keys if k]
+    if len(fernets) == 1:
+        return fernets[0]
+    return MultiFernet(fernets)
 
 
 def encrypt_token(token: Optional[str]) -> Optional[str]:
@@ -72,8 +82,10 @@ def decrypt_token(encrypted_token: Optional[str]) -> Optional[str]:
         return None
     try:
         return _get_fernet().decrypt(encrypted_token.encode("utf-8")).decode("utf-8")
-    except Exception:
-        # Fallback for unencrypted legacy tokens
+    except Exception as e:
+        is_prod = settings.environment.lower() in ("production", "prod")
+        if is_prod:
+            raise ValueError("Failed to decrypt stored auth token") from e
         return encrypted_token
 
 
@@ -177,49 +189,57 @@ async def authenticate_tenant_credentials(
             detail="Security violation: API token in URL query parameter is forbidden in production mode",
         )
 
-    # Resolve and validate Tenant Identity
     tenant_str = (raw_tenant or "").strip()
-    if is_prod:
-        if not tenant_str or tenant_str.lower() == "default":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Header 'X-Tenant-ID' is required in production and cannot be 'default'",
-            )
-        tenant_id = tenant_str
-    else:
-        tenant_id = tenant_str if tenant_str else "default"
-
-    # Validate tenant_id format against strict regex
-    if not TENANT_ID_REGEX.fullmatch(tenant_id):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid tenant_id '{tenant_id}'. Must match pattern '^[a-zA-Z0-9_\\-\\.]+$' (max 63 chars)",
-        )
-
-    # Per-tenant key validation if tenant_keys_json is configured
+    tenant_key_map: dict = {}
     if settings.tenant_keys_json:
         try:
             tenant_key_map = json.loads(settings.tenant_keys_json)
-            if tenant_id in tenant_key_map:
-                expected_key = tenant_key_map[tenant_id]
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Tenant '{tenant_id}' is not authorized or key mapping is missing",
-                )
+            if not isinstance(tenant_key_map, dict):
+                raise ValueError("tenant_keys_json must be a JSON object")
         except json.JSONDecodeError as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Configuration error in SANDBOX_TENANT_KEYS_JSON: {e}",
             )
 
-    if expected_key:
-        if not provided_key or not safe_compare_digest(provided_key, expected_key):
+    if tenant_key_map:
+        matched_tenant = None
+        for tid, key in tenant_key_map.items():
+            if provided_key and safe_compare_digest(provided_key, str(key)):
+                matched_tenant = str(tid)
+                break
+        if not matched_tenant:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized: invalid or missing Sandbox API key",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        if tenant_str and tenant_str != matched_tenant:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="X-Tenant-ID does not match the authenticated tenant key",
+            )
+        tenant_id = matched_tenant
+    else:
+        if is_prod:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Server configuration error: SANDBOX_TENANT_KEYS_JSON required in production",
+            )
+        tenant_id = tenant_str if tenant_str else "default"
+        if expected_key:
+            if not provided_key or not safe_compare_digest(provided_key, expected_key):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Unauthorized: invalid or missing Sandbox API key",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
+    if not TENANT_ID_REGEX.fullmatch(tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid tenant_id '{tenant_id}'. Must match pattern '^[a-zA-Z0-9_\\-\\.]+$' (max 63 chars)",
+        )
 
     # Post-Auth Rate Limiting: executed ONLY after credentials have been verified
     if enforce_rate_limit:

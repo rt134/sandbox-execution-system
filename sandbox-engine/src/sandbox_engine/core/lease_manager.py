@@ -524,6 +524,28 @@ class SQLiteLeaseBackend(LeaseBackend):
     async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         return await asyncio.to_thread(self._sync_claim_workspace, workspace_id, tenant_id)
 
+    async def count_tenant_workspaces(self, tenant_id: str) -> int:
+        return await asyncio.to_thread(self._sync_count_tenant_workspaces, tenant_id)
+
+    def _sync_count_tenant_workspaces(self, tenant_id: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM workspaces WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    async def tenant_has_workspace(self, tenant_id: str, workspace_id: str) -> bool:
+        return await asyncio.to_thread(self._sync_tenant_has_workspace, tenant_id, workspace_id)
+
+    def _sync_tenant_has_workspace(self, tenant_id: str, workspace_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM workspaces WHERE tenant_id = ? AND workspace_id = ?",
+                (tenant_id, workspace_id),
+            ).fetchone()
+            return row is not None
+
     def _sync_claim_workspace(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -1290,6 +1312,23 @@ class PostgresLeaseBackend(LeaseBackend):
             count = await conn.fetchval("SELECT COUNT(*) FROM workspace_locks WHERE expires_at >= $1", now)
             return int(count or 0)
 
+    async def count_tenant_workspaces(self, tenant_id: str) -> int:
+        async with self._pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM workspaces WHERE tenant_id = $1",
+                tenant_id,
+            )
+            return int(count or 0)
+
+    async def tenant_has_workspace(self, tenant_id: str, workspace_id: str) -> bool:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchval(
+                "SELECT 1 FROM workspaces WHERE tenant_id = $1 AND workspace_id = $2",
+                tenant_id,
+                workspace_id,
+            )
+            return row is not None
+
     async def claim_workspace_ownership(self, workspace_id: str, tenant_id: str = "default") -> Tuple[bool, str]:
         now = time.time()
         async with self._pool.acquire() as conn:
@@ -1415,7 +1454,7 @@ class LeaseManager:
             except Exception as e:
                 if settings.environment.lower() in ("production", "prod"):
                     raise RuntimeError(
-                        f"Failed to connect to production PostgreSQL at {pg_url} ({e}). "
+                        f"Failed to connect to production PostgreSQL at {pg_url.split('@')[-1] if '@' in pg_url else 'configured host'} ({e}). "
                         "Refusing to start engine without primary persistent data source."
                     )
                 logger.warning(
@@ -1462,13 +1501,20 @@ class LeaseManager:
         auth_token: Optional[str] = None,
         tenant_id: str = "default",
     ) -> LeaseRecord:
-        ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
+        from .ttl import clamp_new_session_ttl
+
+        ttl = clamp_new_session_ttl(ttl_seconds)
         return await self._backend.create_or_renew_lease(
             session_id, workspace_id, sandbox_id, endpoint, ttl, auth_token=auth_token, tenant_id=tenant_id
         )
 
     async def heartbeat(self, session_id: str, ttl_seconds: Optional[int] = None) -> Optional[LeaseRecord]:
-        ttl = ttl_seconds if ttl_seconds is not None else settings.default_session_ttl
+        from .ttl import clamp_session_ttl
+
+        record = await self.get(session_id)
+        if not record:
+            return None
+        ttl = clamp_session_ttl(record, ttl_seconds)
         return await self._backend.heartbeat(session_id, ttl)
 
     async def get(self, session_id: str) -> Optional[LeaseRecord]:
@@ -1540,6 +1586,16 @@ class LeaseManager:
         if hasattr(self._backend, "claim_workspace_ownership"):
             return await self._backend.claim_workspace_ownership(workspace_id, tenant_id=tenant_id)
         return (True, tenant_id)
+
+    async def count_tenant_workspaces(self, tenant_id: str) -> int:
+        if hasattr(self._backend, "count_tenant_workspaces"):
+            return await self._backend.count_tenant_workspaces(tenant_id)
+        return 0
+
+    async def tenant_has_workspace(self, tenant_id: str, workspace_id: str) -> bool:
+        if hasattr(self._backend, "tenant_has_workspace"):
+            return await self._backend.tenant_has_workspace(tenant_id, workspace_id)
+        return False
 
     async def reserve_session_slot(
         self, tenant_id: str, max_concurrent: int, session_id: Optional[str] = None, workspace_id: Optional[str] = None

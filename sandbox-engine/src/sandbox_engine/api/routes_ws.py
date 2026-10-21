@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import secrets
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 import websockets
 
@@ -58,11 +58,26 @@ async def websocket_pty_proxy(websocket: WebSocket, session_id: str):
 
     # Convert http:// endpoint to ws:// with internal daemon auth token
     container_ws_url = lease.endpoint.replace("http://", "ws://") + "/ws/pty"
+    backend_headers = None
     if lease.auth_token:
-        container_ws_url += f"?token={lease.auth_token}"
+        backend_headers = {"Authorization": f"Bearer {lease.auth_token}"}
+
+    async def periodic_heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(30.0)
+                await lease_mgr.heartbeat(session_id)
+        except asyncio.CancelledError:
+            pass
 
     try:
-        async with websockets.connect(container_ws_url, ping_interval=20, ping_timeout=20) as backend_ws:
+        async with websockets.connect(
+            container_ws_url,
+            ping_interval=20,
+            ping_timeout=20,
+            additional_headers=backend_headers,
+        ) as backend_ws:
+            heartbeat_task = asyncio.create_task(periodic_heartbeat())
 
             async def client_to_backend():
                 try:
@@ -79,7 +94,6 @@ async def websocket_pty_proxy(websocket: WebSocket, session_id: str):
                                 await websocket.close(code=1009, reason="Message exceeds size limit")
                                 break
                             await backend_ws.send(msg["bytes"])
-                        # Auto-extend lease on user activity
                         await lease_mgr.heartbeat(session_id)
                 except (WebSocketDisconnect, asyncio.CancelledError):
                     pass
@@ -91,6 +105,7 @@ async def websocket_pty_proxy(websocket: WebSocket, session_id: str):
                             await websocket.send_text(data)
                         else:
                             await websocket.send_bytes(data)
+                        await lease_mgr.heartbeat(session_id)
                 except (WebSocketDisconnect, asyncio.CancelledError):
                     pass
 
@@ -101,10 +116,13 @@ async def websocket_pty_proxy(websocket: WebSocket, session_id: str):
             done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
     except Exception as e:
         logger.error(f"WebSocket proxy error for session {session_id}: {e}")
         try:
-            await websocket.close(code=1011, reason=str(e))
+            await websocket.close(code=1011, reason="WebSocket proxy error")
         except Exception:
             pass

@@ -46,6 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy compiled shellctl daemon
 COPY --from=builder /bin/shellctl /usr/local/bin/shellctl
 RUN chmod +x /usr/local/bin/shellctl
+COPY entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/sandbox-entrypoint.sh
 
 # Copy stateless python runner script
 RUN mkdir -p /opt/runner
@@ -67,4 +69,4 @@ USER sandbox
 # Expose internal daemon port
 EXPOSE 5004
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/shellctl"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-entrypoint.sh"]

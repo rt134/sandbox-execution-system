@@ -38,15 +38,20 @@ class EngineSettings(BaseSettings):
     max_ws_message_size_bytes: int = 1024 * 1024  # 1MB max WebSocket message
 
     # Per-Tenant Quotas & Limits
-    max_session_ttl: int = 7200  # Max 2 hours session duration
+    max_session_ttl: int = 7200  # Max 2 hours per heartbeat extension
+    max_session_lifetime: int = 7200  # Absolute cap from session created_at
     max_stateless_timeout: float = 60.0  # Max 60 seconds execution timeout
     max_concurrent_sessions_per_tenant: int = 10  # Max active sessions per tenant
+    max_workspaces_per_tenant: int = 20  # Distinct workspace_ids per tenant (PVC cap guard)
     rate_limit_requests_per_minute: int = 120  # Rate limit per tenant
 
     # Pool Configurations (Stateless)
     warm_pool_size: int = 2
     warm_pool_acquire_timeout: float = 5.0
     max_concurrent_spawns: int = 10  # Cap concurrent container launches
+    max_global_sessions: int = 250
+    max_in_flight_requests: int = 100
+    metrics_port: int = 9090
 
     # Environment & Persistence (PostgreSQL)
     environment: str = os.environ.get("ENV", os.environ.get("ENVIRONMENT", "production"))
@@ -60,7 +65,7 @@ class EngineSettings(BaseSettings):
     # Stateful Session Configurations
     default_session_ttl: int = 300
     sweeper_interval_sec: float = 5.0
-    orphan_grace_period_sec: float = 60.0  # Prevent sweeper race on freshly created containers
+    orphan_grace_period_sec: float = 120.0  # Spawn + health margin before orphan reap
     workspaces_root: str = os.environ.get("SANDBOX_WORKSPACES_ROOT", os.path.abspath(".workspaces"))
     redis_url: Optional[str] = None  # Optional secondary cache/coordination
     sqlite_path: str = ".sandbox_ledger.db"
@@ -110,13 +115,26 @@ class EngineSettings(BaseSettings):
                         f"Configuration error: Invalid or empty API key for tenant '{tid}' in SANDBOX_TENANT_KEYS_JSON"
                     )
 
+    def validate_environment_name(self):
+        allowed = {"production", "prod", "development", "dev", "test", "local"}
+        if self.environment.lower() not in allowed:
+            raise ValueError(
+                f"Unknown environment '{self.environment}'. "
+                f"Must be one of: {', '.join(sorted(allowed))}"
+            )
+
     def validate_production_settings(self):
         """
         Validates that production environment has mandatory security configurations.
         Fails fast if auth, persistence, or encryption keys are missing, weak, or default placeholders.
         """
+        self.validate_environment_name()
         self.validate_tenant_keys_json()
         if self.environment.lower() in ("production", "prod"):
+            if not self.tenant_keys_json:
+                raise ValueError(
+                    "Production requires SANDBOX_TENANT_KEYS_JSON mapping tenant_id to API keys."
+                )
             # 1. API Key Validation
             if not self.api_key:
                 raise ValueError(
@@ -183,7 +201,7 @@ class EngineSettings(BaseSettings):
                     raise ValueError(f"Production configuration error: SANDBOX_TENANT_KEYS_JSON contains malformed JSON: {e}")
 
             # 5. Driver & Runtime Isolation Validation
-            if self.driver == "docker" and not os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION"):
+            if self.driver == "docker" and not _allow_insecure_docker_production():
                 raise ValueError(
                     "Production environment requires SANDBOX_DRIVER=k8s with strong container isolation (gVisor/Kata). "
                     "Docker driver is supported for local development and testing only. "
@@ -199,8 +217,7 @@ class EngineSettings(BaseSettings):
     docker_runtime: str = "runc"  # 'runc' for local dev, 'runsc' for gVisor production
     allow_runtime_fallback: bool = False  # Fail hard if requested secure runtime is unavailable!
     docker_network: str = "bridge"
-    docker_network_internal: bool = False  # Set to True for internal network with no direct host egress
-    docker_host_port_start: int = 15000
+    docker_network_internal: bool = True  # Per-sandbox internal Docker networks (dev driver only)
 
     # Kubernetes Specific Settings
     k8s_namespace: str = "sandboxes"
@@ -220,6 +237,11 @@ class EngineSettings(BaseSettings):
     default_cpu_limit: float = 1.0
     default_workspace_disk_quota_mb: int = 1024  # 1GB disk quota
     enable_prometheus_metrics: bool = True
+
+
+def _allow_insecure_docker_production() -> bool:
+    raw = os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION", "").strip().lower()
+    return raw in ("1", "true", "yes")
 
 
 settings = EngineSettings()

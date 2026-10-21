@@ -24,12 +24,33 @@ class RateLimiter:
         self.max_tracked_tenants = max_tracked_tenants
         self._history: OrderedDict[str, List[float]] = OrderedDict()
         self._lock = asyncio.Lock()
+        self._pg_schema_ready = False
 
     def set_redis(self, redis_client):
         self.redis = redis_client
 
     def set_pool(self, pool):
         self.pool = pool
+
+    async def ensure_pg_schema(self) -> None:
+        if not self.pool or self._pg_schema_ready:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tenant_rate_limits (
+                    tenant_id VARCHAR(64) NOT NULL,
+                    window_minute BIGINT NOT NULL,
+                    request_count INT DEFAULT 1,
+                    PRIMARY KEY (tenant_id, window_minute)
+                )
+                """
+            )
+            await conn.execute(
+                "DELETE FROM tenant_rate_limits WHERE window_minute < $1",
+                int(time.time() // 60) - 5,
+            )
+        self._pg_schema_ready = True
 
     async def check_rate_limit(self, tenant_id: str, limit: Optional[int] = None) -> None:
         """
@@ -61,18 +82,9 @@ class RateLimiter:
         # 2. Distributed PostgreSQL Implementation (multi-replica synchronized)
         if self.pool:
             try:
+                await self.ensure_pg_schema()
                 now_minute = int(time.time() // 60)
                 async with self.pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS tenant_rate_limits (
-                            tenant_id VARCHAR(64) NOT NULL,
-                            window_minute BIGINT NOT NULL,
-                            request_count INT DEFAULT 1,
-                            PRIMARY KEY (tenant_id, window_minute)
-                        )
-                        """
-                    )
                     count = await conn.fetchval(
                         """
                         INSERT INTO tenant_rate_limits (tenant_id, window_minute, request_count)

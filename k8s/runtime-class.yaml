@@ -3,6 +3,10 @@ kind: RuntimeClass
 metadata:
   name: gvisor
 handler: runsc
+overhead:
+  podFixed:
+    cpu: 50m
+    memory: 50Mi
 scheduling:
   nodeSelector:
     sandbox: "true"

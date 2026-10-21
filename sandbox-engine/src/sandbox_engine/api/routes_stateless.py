@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..config import settings
+from ..core.http_client import request_with_byte_cap
 from ..core.metrics import STATELESS_DURATION_SECONDS, STATELESS_RUNS_TOTAL
 from ..core.security import verify_api_key
 from ..core.warm_pool import WarmPoolManager
@@ -44,7 +46,7 @@ async def run_stateless_code(
 
     # 1. Grab a pre-warmed sandbox (<1ms)
     try:
-        instance = await warm_pool.acquire(timeout=5.0)
+        instance = await warm_pool.acquire(timeout=settings.warm_pool_acquire_timeout)
     except Exception as e:
         STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="pool_exhausted").inc()
         raise HTTPException(status_code=503, detail=f"No available warm sandbox: {e}")
@@ -56,31 +58,24 @@ async def run_stateless_code(
         if instance.auth_token:
             headers["Authorization"] = f"Bearer {instance.auth_token}"
 
-        async with httpx.AsyncClient(timeout=timeout_client, headers=headers) as client:
-            resp = await client.post(
-                f"{instance.endpoint}/execute",
-                json={
-                    "language": payload.language,
-                    "code": payload.code,
-                    "inputs": payload.inputs,
-                    "timeout": payload.timeout,
-                },
-            )
+        body, status_code, _ = await request_with_byte_cap(
+            "POST",
+            f"{instance.endpoint}/execute",
+            json={
+                "language": payload.language,
+                "code": payload.code,
+                "inputs": payload.inputs,
+                "timeout": payload.timeout,
+            },
+            headers=headers,
+            timeout_seconds=payload.timeout + 2.0,
+        )
 
-        if len(resp.content) > settings.max_response_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail="Stateless response payload exceeds maximum allowed limit (10MB)",
-            )
-
-        if resp.status_code != 200:
+        if status_code != 200:
             status = "failed"
-            raise HTTPException(
-                status_code=resp.status_code,
-                detail=f"In-sandbox daemon returned {resp.status_code}: {resp.text}",
-            )
+            raise HTTPException(status_code=status_code, detail="In-sandbox execution failed")
 
-        data = resp.json()
+        data = json.loads(body)
         duration_sec = time.perf_counter() - start_time
         total_duration_ms = duration_sec * 1000
 

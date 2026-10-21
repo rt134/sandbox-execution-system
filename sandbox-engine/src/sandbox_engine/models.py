@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, conint
 
 
 class SandboxSpec(BaseModel):
@@ -61,7 +61,7 @@ class LeaseRecord(BaseModel):
 class SessionAcquireRequest(BaseModel):
     session_id: Optional[str] = None
     workspace_id: str
-    ttl_seconds: Optional[int] = None
+    ttl_seconds: Optional[conint(gt=0)] = None
 
 
 class SessionAcquireResponse(BaseModel):
@@ -74,7 +74,7 @@ class SessionAcquireResponse(BaseModel):
 
 
 class HeartbeatRequest(BaseModel):
-    ttl_seconds: Optional[int] = None
+    ttl_seconds: Optional[conint(gt=0)] = None
 
 
 class HeartbeatResponse(BaseModel):

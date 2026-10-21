@@ -17,8 +17,8 @@ class ContainerDriver(ABC):
         pass
 
     @abstractmethod
-    async def destroy_sandbox(self, sandbox_id: str) -> None:
-        """Forcefully and gracefully destroy a container/pod."""
+    async def destroy_sandbox(self, sandbox_id: str, remove_workspace: bool = False) -> None:
+        """Forcefully destroy a container/pod; optionally remove host workspace (Docker)."""
         pass
 
     @abstractmethod

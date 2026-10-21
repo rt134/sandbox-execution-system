@@ -74,7 +74,8 @@ class Sweeper:
             logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
             try:
                 if lease.sandbox_id and lease.sandbox_id != "pending":
-                    await self.driver.destroy_sandbox(lease.sandbox_id)
+                    remove_ws = settings.driver == "docker" and bool(lease.workspace_id)
+                    await self.driver.destroy_sandbox(lease.sandbox_id, remove_workspace=remove_ws)
                 SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
             except Exception as e:
                 logger.error(f"Failed to destroy sandbox {lease.sandbox_id}: {e}")

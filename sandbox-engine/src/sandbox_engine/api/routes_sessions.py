@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from ..config import settings
+from ..core.http_client import request_with_byte_cap, stream_response_bytes
 from ..core.lease_manager import LeaseManager
 from ..core.metrics import ACTIVE_SESSIONS, WORKSPACE_LOCKS_ACTIVE
 from ..core.security import (
@@ -56,16 +57,19 @@ async def acquire_session(
         validate_session_id(payload.session_id)
     session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
     workspace_id = payload.workspace_id
-    ttl = payload.ttl_seconds or settings.default_session_ttl
+    from ..core.ttl import clamp_new_session_ttl
 
-    # Quota Guard: Enforce maximum session TTL limit
-    if ttl > settings.max_session_ttl:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Requested TTL ({ttl}s) exceeds maximum allowed limit ({settings.max_session_ttl}s)",
-        )
+    ttl = clamp_new_session_ttl(payload.ttl_seconds)
 
     tenant_id = getattr(request.state, "tenant_id", "default")
+
+    if not await lease_mgr.tenant_has_workspace(tenant_id, workspace_id):
+        ws_count = await lease_mgr.count_tenant_workspaces(tenant_id)
+        if ws_count >= settings.max_workspaces_per_tenant:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Tenant workspace quota exceeded ({settings.max_workspaces_per_tenant} distinct workspaces max)",
+            )
 
     # Multi-Tenant Ownership Guard: Verify that workspace_id is owned by caller's tenant
     is_owner, current_owner = await lease_mgr.claim_workspace_ownership(workspace_id, tenant_id=tenant_id)
@@ -100,29 +104,42 @@ async def acquire_session(
         workspace_id, settings.workspaces_root, tenant_id=tenant_id, create_host_dir=not is_k8s
     )
 
-    # Concurrency Lock: Ensure workspace is not held by another active session
-    acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
-        workspace_id=workspace_id,
-        session_id=session_id,
-        ttl_seconds=ttl,
-        tenant_id=tenant_id,
-    )
-    if not acquired:
+    global_active = len(await lease_mgr.list_active())
+    if global_active >= settings.max_global_sessions:
         if reserved_provisional:
             await lease_mgr.release(session_id)
-        remaining = max(0.0, expires_at - time.time()) if expires_at else 0.0
         raise HTTPException(
-            status_code=409,
-            detail={
-                "error": "Workspace is currently locked by another active session",
-                "workspace_id": workspace_id,
-                "locked_by": locked_by,
-                "expires_at": expires_at,
-                "ttl_remaining_sec": round(remaining, 1),
-            },
+            status_code=503,
+            detail="Global session capacity reached",
+            headers={"Retry-After": "30"},
         )
 
+    lock_held = False
+    lease_committed = False
+    spawned_sandbox: str | None = None
     try:
+        acquired, locked_by, expires_at = await lease_mgr.acquire_workspace_lock(
+            workspace_id=workspace_id,
+            session_id=session_id,
+            ttl_seconds=ttl,
+            tenant_id=tenant_id,
+        )
+        if not acquired:
+            if reserved_provisional:
+                await lease_mgr.release(session_id)
+            remaining = max(0.0, expires_at - time.time()) if expires_at else 0.0
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Workspace is currently locked by another active session",
+                    "workspace_id": workspace_id,
+                    "locked_by": locked_by,
+                    "expires_at": expires_at,
+                    "ttl_remaining_sec": round(remaining, 1),
+                },
+            )
+        lock_held = True
+
         # Check for existing active lease to reattach
         if existing and existing.status == "active":
             if existing.tenant_id and existing.tenant_id != tenant_id:
@@ -131,6 +148,7 @@ async def acquire_session(
             if await driver.healthcheck(existing.endpoint, auth_token=existing.auth_token):
                 await lease_mgr.heartbeat(session_id, ttl)
                 await lease_mgr.refresh_workspace_lock(workspace_id, session_id, ttl, tenant_id=tenant_id)
+                lease_committed = True
                 return SessionAcquireResponse(
                     session_id=existing.session_id,
                     workspace_id=existing.workspace_id,
@@ -144,24 +162,28 @@ async def acquire_session(
             os.makedirs(workspace_dir, exist_ok=True)
         auth_token = generate_daemon_token()
 
-        # Spawn new stateful sandbox container with cgroup pids & disk quota enforcement
         spec = SandboxSpec(
             spec_id=session_id,
             sandbox_type="stateful",
             image=settings.image,
             workspace_path=workspace_dir,
-            labels={"sandbox.session_id": session_id, "sandbox.workspace_id": workspace_id, "sandbox.tenant_id": tenant_id},
-            pids_limit=getattr(payload, "pids_limit", None) or settings.pids_limit,
-            disk_quota_mb=getattr(payload, "disk_quota_mb", None) or settings.default_workspace_disk_quota_mb,
+            mem_limit=settings.default_mem_limit,
+            cpu_limit=settings.default_cpu_limit,
+            labels={
+                "sandbox.session_id": session_id,
+                "sandbox.workspace_id": workspace_id,
+                "sandbox.tenant_id": tenant_id,
+                **({"sandbox.workspace_host_path": workspace_dir} if not is_k8s else {}),
+            },
+            pids_limit=settings.pids_limit,
+            disk_quota_mb=settings.default_workspace_disk_quota_mb,
             auth_token=auth_token,
         )
 
         instance = await driver.create_sandbox(spec)
+        spawned_sandbox = instance.sandbox_id
         ready = await driver.healthcheck(instance.endpoint, auth_token=auth_token)
         if not ready:
-            await driver.destroy_sandbox(instance.sandbox_id)
-            if reserved_provisional:
-                await lease_mgr.release(session_id)
             raise HTTPException(status_code=502, detail="Stateful sandbox failed healthcheck")
 
         lease = await lease_mgr.create_or_renew(
@@ -180,6 +202,8 @@ async def acquire_session(
         active_locks = await lease_mgr.count_active_locks()
         WORKSPACE_LOCKS_ACTIVE.set(active_locks)
 
+        spawned_sandbox = None
+        lease_committed = True
         return SessionAcquireResponse(
             session_id=lease.session_id,
             workspace_id=lease.workspace_id,
@@ -192,10 +216,16 @@ async def acquire_session(
     except HTTPException:
         raise
     except Exception as e:
-        await lease_mgr.release_workspace_lock(workspace_id, session_id, tenant_id=tenant_id)
-        if reserved_provisional:
-            await lease_mgr.release(session_id)
-        raise HTTPException(status_code=500, detail=f"Failed to acquire session: {e}")
+        raise HTTPException(status_code=500, detail="Failed to acquire session") from e
+    finally:
+        if not lease_committed:
+            if lock_held:
+                await lease_mgr.release_workspace_lock(workspace_id, session_id, tenant_id=tenant_id)
+            if reserved_provisional:
+                await lease_mgr.release(session_id)
+            if spawned_sandbox:
+                remove_ws = settings.driver == "docker"
+                await driver.destroy_sandbox(spawned_sandbox, remove_workspace=remove_ws)
 
 
 @router.post("/{session_id}/heartbeat", response_model=HeartbeatResponse)
@@ -332,8 +362,11 @@ async def proxy_exec(
 
         return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
 
-    # Buffered execution with auto-keepalive to prevent lease sweep during long execution
-    timeout_val = float(body.get("timeout", 300.0))
+    try:
+        timeout_val = float(body.get("timeout", 300.0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid exec timeout value")
+    timeout_val = min(max(timeout_val, 0.1), 1800.0)
     stop_keepalive = asyncio.Event()
 
     async def buffered_keepalive_loop():
@@ -346,11 +379,18 @@ async def proxy_exec(
 
     keepalive_task = asyncio.create_task(buffered_keepalive_loop())
     try:
-        async with httpx.AsyncClient(timeout=timeout_val + 10.0) as client:
-            resp = await client.post(f"{endpoint}/exec", json=body, headers=headers)
-            if len(resp.content) > settings.max_response_bytes:
-                raise HTTPException(status_code=413, detail="Execution response exceeds maximum allowed size")
-            return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+        content, status_code, resp_headers = await request_with_byte_cap(
+            "POST",
+            f"{endpoint}/exec",
+            json=body,
+            headers=headers,
+            timeout_seconds=timeout_val + 10.0,
+        )
+        return Response(
+            content=content,
+            status_code=status_code,
+            media_type=resp_headers.get("content-type", "application/json"),
+        )
     finally:
         stop_keepalive.set()
         keepalive_task.cancel()
@@ -391,11 +431,17 @@ async def proxy_fs_read(
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(f"{endpoint}/fs/read", params={"path": path}, headers=headers)
-        if len(resp.content) > settings.max_response_bytes:
-            raise HTTPException(status_code=413, detail="File content exceeds maximum allowed size")
-        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
+    async def file_stream():
+        async for chunk in stream_response_bytes(
+            "GET",
+            f"{endpoint}/fs/read",
+            params={"path": path},
+            headers=headers,
+            max_bytes=settings.max_response_bytes,
+        ):
+            yield chunk
+
+    return StreamingResponse(file_stream(), media_type="application/octet-stream")
 
 
 @router.get("/{session_id}/fs/list")

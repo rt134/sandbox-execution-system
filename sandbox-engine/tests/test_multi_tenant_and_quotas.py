@@ -50,11 +50,14 @@ class MockDriver(ContainerDriver):
 @pytest.mark.asyncio
 async def test_two_tenants_both_use_main_workspace():
     """Verify that workspace names and locks are scoped to (tenant_id, workspace_id) so two tenants can both use 'main'."""
+    import uuid
+
+    suffix = uuid.uuid4().hex[:8]
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            headers_tenant_a = {"X-Tenant-ID": "tenant_alpha"}
-            headers_tenant_b = {"X-Tenant-ID": "tenant_bravo"}
+            headers_tenant_a = {"X-Tenant-ID": f"tenant_alpha_{suffix}"}
+            headers_tenant_b = {"X-Tenant-ID": f"tenant_bravo_{suffix}"}
 
             # 1. Tenant A acquires workspace 'main'
             resp_a = await client.post(
@@ -124,10 +127,14 @@ def test_k8s_pvc_hash_collision_prevention():
 def test_production_secret_validation():
     """Verify that validate_production_settings() rejects weak secrets, placeholders, and insecure defaults."""
     # 1. Placeholder API Key
+    _pg = "postgresql://sandbox:sandbox@localhost:5432/sandbox"
+    _tk = '{"prodtenant": "' + ("x" * 32) + '"}'
     s1 = EngineSettings(
         environment="production",
         api_key="prod-secret-sandbox-key-replace-me",
         encryption_key="a" * 32,
+        postgres_url=_pg,
+        tenant_keys_json=_tk,
         driver="k8s",
     )
     with pytest.raises(ValueError, match="placeholder"):
@@ -138,6 +145,8 @@ def test_production_secret_validation():
         environment="production",
         api_key="short_secret",
         encryption_key="a" * 32,
+        postgres_url=_pg,
+        tenant_keys_json=_tk,
         driver="k8s",
     )
     with pytest.raises(ValueError, match="at least 32 characters"):
@@ -148,6 +157,8 @@ def test_production_secret_validation():
         environment="production",
         api_key="b" * 32,
         encryption_key="default-sandbox-secret-replace-in-production",
+        postgres_url=_pg,
+        tenant_keys_json=_tk,
         driver="k8s",
     )
     with pytest.raises(ValueError, match="placeholder"):
@@ -158,7 +169,8 @@ def test_production_secret_validation():
         environment="production",
         api_key="c" * 32,
         encryption_key="d" * 32,
-        postgres_url="postgresql://sandbox:sandbox@localhost:5432/sandbox",
+        postgres_url=_pg,
+        tenant_keys_json=_tk,
         driver="docker",
         docker_runtime="runc",
         allow_insecure_docker_production=False,
@@ -173,6 +185,7 @@ def test_production_secret_validation():
         encryption_key="f" * 32,
         postgres_url="postgresql://sandbox:sandbox@localhost:5432/sandbox",
         driver="k8s",
+        tenant_keys_json='{"prodtenant": "' + ("e" * 32) + '"}',
     )
     s5.validate_production_settings()
 
@@ -185,14 +198,14 @@ async def test_per_tenant_quotas_and_rate_limiting():
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             headers = {"X-Tenant-ID": "quota_test_tenant"}
 
-            # 1. Excessive TTL rejection
+            # 1. Negative TTL rejected by schema
             resp_ttl = await client.post(
                 "/v1/sessions/acquire",
-                json={"workspace_id": "ws_ttl_test", "ttl_seconds": 999999},
+                json={"workspace_id": "ws_ttl_test", "ttl_seconds": -1},
                 headers=headers,
             )
-            assert resp_ttl.status_code == 400
-            assert "exceeds maximum allowed limit" in resp_ttl.text
+            assert resp_ttl.status_code == 422
+            assert "greater than 0" in resp_ttl.text
 
             # 2. Excessive stateless timeout rejection
             resp_stateless = await client.post(
@@ -274,15 +287,18 @@ async def test_dead_container_sweeper_reconciliation():
 
 def test_websocket_cross_tenant_rejection():
     """Verify that WebSocket PTY route rejects connections from another tenant with code 4403."""
+    import uuid
+
     from starlette.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
 
+    suffix = uuid.uuid4().hex[:8]
     with TestClient(app) as test_client:
         # 1. Acquire session for tenant_owner
         resp = test_client.post(
             "/v1/sessions/acquire",
-            json={"workspace_id": "ws_for_websocket_sec", "ttl_seconds": 60},
-            headers={"X-Tenant-ID": "tenant_owner"},
+            json={"workspace_id": f"ws_ws_sec_{suffix}", "ttl_seconds": 60},
+            headers={"X-Tenant-ID": f"tenant_owner_{suffix}"},
         )
         assert resp.status_code == 200
         sess_data = resp.json()
@@ -292,7 +308,7 @@ def test_websocket_cross_tenant_rejection():
         with pytest.raises(WebSocketDisconnect) as excinfo:
             with test_client.websocket_connect(
                 f"/v1/sessions/{session_id}/ws/pty",
-                headers={"X-Tenant-ID": "tenant_intruder"},
+                headers={"X-Tenant-ID": f"tenant_intruder_{suffix}"},
             ):
                 pass
         assert excinfo.value.code == 4403, f"Expected WS close code 4403, got {excinfo.value.code}"

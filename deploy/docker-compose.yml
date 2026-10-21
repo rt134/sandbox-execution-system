@@ -37,6 +37,7 @@ services:
       - "127.0.0.1:3128:3128"
     restart: unless-stopped
 
+  # Dev-only: CONTAINERS+POST on the Docker socket equals host root if the engine is compromised.
   docker-proxy:
     image: tecnativa/docker-socket-proxy:0.1.1@sha256:90538a74e14f6b283c7ccfa89ef64ce49efda8b1398863f6a27e7ff5141c2c2f
     container_name: sandbox-docker-proxy
@@ -60,13 +61,13 @@ services:
       dockerfile: Dockerfile
     container_name: sandbox-engine
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - DOCKER_HOST=tcp://docker-proxy:2375
-      - SANDBOX_ENVIRONMENT=production
+      - SANDBOX_ENVIRONMENT=development
       - SANDBOX_DRIVER=docker
       - SANDBOX_DOCKER_RUNTIME=${SANDBOX_DOCKER_RUNTIME:-runsc}
-      - ALLOW_INSECURE_DOCKER_PRODUCTION=${ALLOW_INSECURE_DOCKER_PRODUCTION:-0}
+      - SANDBOX_DOCKER_NETWORK_INTERNAL=true
       - SANDBOX_WORKSPACES_ROOT=/workspaces
       - SANDBOX_POSTGRES_URL=postgresql://${POSTGRES_USER:-sandbox}:${POSTGRES_PASSWORD:-sandbox}@postgres:5432/${POSTGRES_DB:-sandbox}
       - SANDBOX_REDIS_URL=redis://redis:6379/0

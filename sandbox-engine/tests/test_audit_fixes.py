@@ -249,3 +249,51 @@ async def test_sweeper_skips_pending_leases():
     mock_driver.is_alive.assert_not_called()
     # Verify pending lease was NOT marked expired
     mock_lease_mgr.mark_expired.assert_not_called()
+
+
+def test_allow_insecure_docker_production_only_true_values():
+    import os
+
+    from sandbox_engine.config import _allow_insecure_docker_production
+
+    os.environ["ALLOW_INSECURE_DOCKER_PRODUCTION"] = "0"
+    assert not _allow_insecure_docker_production()
+    os.environ["ALLOW_INSECURE_DOCKER_PRODUCTION"] = "1"
+    assert _allow_insecure_docker_production()
+    del os.environ["ALLOW_INSECURE_DOCKER_PRODUCTION"]
+
+
+def test_unknown_environment_rejected():
+    from sandbox_engine.config import EngineSettings
+
+    s = EngineSettings(environment="live")
+    with pytest.raises(ValueError, match="Unknown environment"):
+        s.validate_environment_name()
+
+
+def test_clamp_session_ttl_respects_absolute_lifetime():
+    from sandbox_engine.core.ttl import clamp_session_ttl
+    from sandbox_engine.models import LeaseRecord
+
+    record = LeaseRecord(
+        session_id="s1",
+        workspace_id="w",
+        sandbox_id="sb",
+        endpoint="http://127.0.0.1:1",
+        created_at=time.time() - 8000,
+        expires_at=time.time() + 100,
+    )
+    assert clamp_session_ttl(record, 3600) == 1
+
+
+@pytest.mark.asyncio
+async def test_pvc_gc_does_not_raise_nameerror():
+    from sandbox_engine.drivers.k8s_driver import KubernetesDriver
+
+    driver = KubernetesDriver()
+    driver._initialized = True
+    driver._core_api = AsyncMock()
+    driver._core_api.list_namespaced_persistent_volume_claim = AsyncMock(return_value=MagicMock(items=[]))
+    driver._core_api.list_namespaced_pod = AsyncMock(return_value=MagicMock(items=[]))
+    deleted = await driver.cleanup_orphaned_pvcs(set())
+    assert deleted == 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
 from typing import Dict, List, Optional
@@ -12,6 +13,8 @@ from kubernetes_asyncio.client.exceptions import ApiException
 from ..config import settings
 from ..models import SandboxInstance, SandboxSpec
 from .base import ContainerDriver
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_k8s_mem(mem: str) -> str:
@@ -42,10 +45,7 @@ class KubernetesDriver(ContainerDriver):
             try:
                 config.load_incluster_config()
             except Exception:
-                try:
-                    await config.load_kube_config()
-                except Exception:
-                    pass
+                await config.load_kube_config()
             self._core_api = client.CoreV1Api()
             self._initialized = True
 
@@ -97,8 +97,9 @@ class KubernetesDriver(ContainerDriver):
         normalized_mem = normalize_k8s_mem(spec.mem_limit)
 
         # Volume mounts for stateful sandboxes
+        tmp_limit = f"{min(spec.disk_quota_mb, 512)}Mi"
         pod_volumes = [
-            client.V1Volume(name="tmp-dir", empty_dir=client.V1EmptyDirVolumeSource())
+            client.V1Volume(name="tmp-dir", empty_dir=client.V1EmptyDirVolumeSource(size_limit=tmp_limit))
         ]
         volume_mounts = [
             client.V1VolumeMount(name="tmp-dir", mount_path="/tmp")
@@ -125,7 +126,7 @@ class KubernetesDriver(ContainerDriver):
             else:
                 volume = client.V1Volume(
                     name=vol_name,
-                    empty_dir=client.V1EmptyDirVolumeSource(),
+                    empty_dir=client.V1EmptyDirVolumeSource(size_limit=f"{spec.disk_quota_mb}Mi"),
                 )
             pod_volumes.append(volume)
             volume_mounts.append(client.V1VolumeMount(name=vol_name, mount_path="/workspace"))
@@ -137,6 +138,7 @@ class KubernetesDriver(ContainerDriver):
             read_only_root_filesystem=True,
             run_as_non_root=True,
             run_as_user=1000,
+            run_as_group=1000,
             seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
 
@@ -154,19 +156,29 @@ class KubernetesDriver(ContainerDriver):
                     "memory": normalized_mem,
                     "ephemeral-storage": f"{spec.disk_quota_mb}Mi",
                 },
-                requests={"cpu": "100m", "memory": "128Mi"},
+                requests={
+                    "cpu": str(spec.cpu_limit),
+                    "memory": normalized_mem,
+                    "ephemeral-storage": f"{spec.disk_quota_mb}Mi",
+                },
             ),
         )
 
-        pod_spec = client.V1PodSpec(
+        pod_spec_kwargs = dict(
             runtime_class_name=settings.k8s_runtime_class,
             tolerations=tolerations,
             node_selector=node_selector,
-            automount_service_account_token=False,  # Security hardening
+            automount_service_account_token=False,
+            enable_service_links=False,
+            security_context=client.V1PodSecurityContext(fs_group=1000, run_as_group=1000),
             containers=[container],
             volumes=pod_volumes if pod_volumes else None,
             restart_policy="Never",
+            termination_grace_period_seconds=5,
         )
+        if spec.sandbox_type == "stateful":
+            pod_spec_kwargs["active_deadline_seconds"] = settings.max_session_lifetime
+        pod_spec = client.V1PodSpec(**pod_spec_kwargs)
 
         pod = client.V1Pod(
             metadata=client.V1ObjectMeta(name=pod_name, namespace=namespace, labels=labels),
@@ -196,7 +208,7 @@ class KubernetesDriver(ContainerDriver):
                     is_ready = any(cs.ready for cs in curr.status.container_statuses if cs.name == "sandbox-kernel")
 
                 # If ready or phase is Running with IP
-                if is_ready or curr.status.phase == "Running":
+                if is_ready:
                     break
 
         if not pod_ip:
@@ -214,18 +226,19 @@ class KubernetesDriver(ContainerDriver):
             auth_token=spec.auth_token,
         )
 
-    async def destroy_sandbox(self, sandbox_id: str) -> None:
+    async def destroy_sandbox(self, sandbox_id: str, remove_workspace: bool = False) -> None:
         await self._init_client()
         namespace = settings.k8s_namespace
         try:
             await self._core_api.delete_namespaced_pod(
                 name=sandbox_id,
                 namespace=namespace,
-                grace_period_seconds=0,
+                grace_period_seconds=5,
             )
         except ApiException as e:
             if e.status != 404:
-                pass
+                logger.error("Failed to delete pod %s: %s", sandbox_id, e)
+                raise
 
     async def get_sandbox_endpoint(self, sandbox_id: str) -> str:
         await self._init_client()
@@ -289,12 +302,19 @@ class KubernetesDriver(ContainerDriver):
         if it does not already exist.
         """
         await self._init_client()
+        now_label = str(int(time.time()))
         try:
-            await self._core_api.read_namespaced_persistent_volume_claim(
+            existing = await self._core_api.read_namespaced_persistent_volume_claim(
                 name=pvc_name,
                 namespace=namespace,
             )
-            return  # PVC already exists and is bound to this workspace
+            labels = dict(existing.metadata.labels or {})
+            labels["sandbox.last_used"] = now_label
+            patch = {"metadata": {"labels": labels}}
+            await self._core_api.patch_namespaced_persistent_volume_claim(
+                name=pvc_name, namespace=namespace, body=patch
+            )
+            return
         except ApiException as e:
             if e.status != 404:
                 raise
@@ -308,7 +328,8 @@ class KubernetesDriver(ContainerDriver):
                     "sandbox.managed": "true",
                     "sandbox.tenant_id": str(tenant_id),
                     "sandbox.workspace_id": str(workspace_id),
-                    "sandbox.created_at": str(int(time.time())),
+                    "sandbox.created_at": now_label,
+                    "sandbox.last_used": now_label,
                 },
             ),
             spec=client.V1PersistentVolumeClaimSpec(
@@ -377,8 +398,8 @@ class KubernetesDriver(ContainerDriver):
                 if scope_key in active_workspace_keys:
                     continue  # Active session exists for this workspace
 
-                created_at = float(labels.get("sandbox.created_at", 0.0))
-                if created_at > 0 and (now - created_at) > max_age_seconds:
+                last_used = float(labels.get("sandbox.last_used", labels.get("sandbox.created_at", 0.0)))
+                if last_used > 0 and (now - last_used) > max_age_seconds:
                     logger.info(f"🧹 [PVC GC] Deleting orphaned PVC '{pvc_name}' for workspace '{scope_key}'")
                     try:
                         await self._core_api.delete_namespaced_persistent_volume_claim(
