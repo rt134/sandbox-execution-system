@@ -64,7 +64,7 @@ func main() {
 	}
 
 	host := os.Getenv("SHELLCTL_HOST")
-	if host == "" {
+	if host == "" || host == "auto" {
 		host = "0.0.0.0"
 	}
 

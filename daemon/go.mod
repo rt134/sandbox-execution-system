@@ -1,6 +1,6 @@
 module github.com/sandbox-execution-system/shellctl
 
-go 1.25
+go 1.22
 
 require (
 	github.com/creack/pty v1.1.24

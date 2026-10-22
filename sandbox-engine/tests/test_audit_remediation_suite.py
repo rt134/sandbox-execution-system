@@ -147,6 +147,10 @@ async def test_sweeper_dead_container_reconciliation_and_leader_election_n3_n4(t
     assert live_lease.status == "active"
 
     # Leader election test (N4): Engine 1 holds lease, Engine 2 is denied until expiry
+    import sqlite3
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("DELETE FROM sweeper_leader")
+        conn.commit()
     assert await lease_mgr.try_acquire_sweeper_leader("engine-1", ttl_seconds=15.0) is True
     assert await lease_mgr.try_acquire_sweeper_leader("engine-2", ttl_seconds=15.0) is False
     # Engine 1 renewal succeeds
@@ -157,10 +161,11 @@ async def test_sweeper_dead_container_reconciliation_and_leader_election_n3_n4(t
 async def test_auth_api_key_only_and_tenant_keys_validation_n1_n2():
     """Verify that config validation works with tenant-keys only (N1) and api-key-only auth works (N2)."""
     from sandbox_engine.core.security import authenticate_tenant_credentials
-    from sandbox_engine.config import SandboxSettings
+    from sandbox_engine.config import EngineSettings, SandboxSettings
 
     # N1: Validation does not crash with UnboundLocalError when api_key is None
     cfg = SandboxSettings(
+        driver="k8s",
         environment="production",
         tenant_keys_json='{"tenant-1": "0123456789abcdef0123456789abcdef"}',
         api_key=None,
@@ -181,7 +186,7 @@ async def test_auth_api_key_only_and_tenant_keys_validation_n1_n2():
 
         # Correct API key authentication succeeds without 500
         tid = await authenticate_tenant_credentials(
-            auth_header=f"Bearer {settings.api_key}",
+            provided_key=settings.api_key,
             raw_tenant="custom-tenant",
             enforce_rate_limit=False,
         )
@@ -190,7 +195,7 @@ async def test_auth_api_key_only_and_tenant_keys_validation_n1_n2():
         # Invalid key returns 401
         with pytest.raises(HTTPException) as exc_info:
             await authenticate_tenant_credentials(
-                auth_header="Bearer wrong-key-value",
+                provided_key="wrong-key-value",
                 raw_tenant="custom-tenant",
                 enforce_rate_limit=False,
             )

@@ -1128,6 +1128,7 @@ class PostgresLeaseBackend(LeaseBackend):
                 ON CONFLICT (session_id) DO UPDATE SET
                     sandbox_id = EXCLUDED.sandbox_id,
                     workspace_id = EXCLUDED.workspace_id,
+                    created_at = CASE WHEN leases.expires_at < EXCLUDED.created_at OR leases.status IN ('expired', 'released') THEN EXCLUDED.created_at ELSE leases.created_at END,
                     expires_at = EXCLUDED.expires_at,
                     status = 'active',
                     endpoint = EXCLUDED.endpoint,

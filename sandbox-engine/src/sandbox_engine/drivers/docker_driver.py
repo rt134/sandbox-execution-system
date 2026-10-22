@@ -83,7 +83,7 @@ class DockerDriver(ContainerDriver):
 
         env = {
             "WORKSPACE_DISK_QUOTA_MB": str(spec.disk_quota_mb),
-            "SHELLCTL_HOST": "auto",
+            "SHELLCTL_HOST": "0.0.0.0",
             **spec.env,
         }
         if spec.auth_token:

@@ -230,7 +230,7 @@ class EngineSettings(BaseSettings):
     docker_runtime: str = "runc"  # 'runc' for local dev, 'runsc' for gVisor production
     allow_runtime_fallback: bool = False  # Fail hard if requested secure runtime is unavailable!
     docker_network: str = "bridge"
-    docker_network_internal: bool = True  # Per-sandbox internal Docker networks (dev driver only)
+    docker_network_internal: bool = False  # Set to True for internal Docker networks (e.g. inside docker-compose)
 
     # Kubernetes Specific Settings
     k8s_namespace: str = "sandboxes"
@@ -258,3 +258,4 @@ def _allow_insecure_docker_production() -> bool:
 
 
 settings = EngineSettings()
+SandboxSettings = EngineSettings  # Backwards-compatibility alias
