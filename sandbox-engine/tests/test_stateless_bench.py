@@ -22,9 +22,17 @@ async def run_benchmark():
     print("🚀 Starting Phase 2: Warm Pool Stateless Execution Benchmark")
     print("=" * 65)
 
+    from sandbox_engine.config import settings
+    if settings.environment in ("production", "prod") and not settings.api_key and not settings.tenant_keys_json:
+        settings.environment = "development"
+
     # 1. Start FastAPI Lifespan (Initializes DockerDriver & Warm Pool)
     async with app.router.lifespan_context(app):
-        # Allow warm pool to settle
+        # Allow warm pool background replenish to settle
+        for _ in range(50):
+            if app.state.warm_pool.queue.qsize() > 0:
+                break
+            await asyncio.sleep(0.1)
         print(f"Initial warm pool ready count: {app.state.warm_pool.queue.qsize()}")
         assert app.state.warm_pool.queue.qsize() > 0, "Warm pool is empty on startup!"
 

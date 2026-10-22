@@ -1,5 +1,6 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["sandbox-engine/tests", "sandbox-client/tests"]
 markers = [
     "integration: tests that require a live Docker daemon and real sandbox containers",
 ]

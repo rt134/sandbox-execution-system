@@ -5,12 +5,28 @@ Tests /health, /execute, /exec, /fs/*, and /ws/pty against a running container.
 """
 
 import json
+import os
 import sys
 import time
 import urllib.request
 import urllib.error
 
-BASE_URL = "http://localhost:5004"
+try:
+    import pytest
+except ImportError:
+    pytest = None
+
+BASE_URL = os.environ.get("SHELLCTL_BASE_URL", "http://localhost:5004")
+AUTH_TOKEN = os.environ.get("SHELLCTL_AUTH_TOKEN", "")
+
+# If run via pytest and daemon is not running, skip
+if pytest:
+    try:
+        req = urllib.request.Request(f"{BASE_URL}/health")
+        with urllib.request.urlopen(req, timeout=0.5):
+            pass
+    except Exception:
+        pytestmark = pytest.mark.skip(reason=f"Standalone shellctl daemon not reachable on {BASE_URL}")
 
 def log_test(name, passed, detail=""):
     status = "✅ PASS" if passed else "❌ FAIL"
@@ -18,17 +34,26 @@ def log_test(name, passed, detail=""):
     if not passed:
         sys.exit(1)
 
+def _auth_headers(extra=None):
+    h = dict(extra or {})
+    if AUTH_TOKEN:
+        h["Authorization"] = f"Bearer {AUTH_TOKEN}"
+    return h
+
 def http_post(path, data):
+    headers = _auth_headers({"Content-Type": "application/json"})
     req = urllib.request.Request(
         f"{BASE_URL}{path}",
         data=json.dumps(data).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 def http_get(path):
-    with urllib.request.urlopen(f"{BASE_URL}{path}", timeout=10) as resp:
+    headers = _auth_headers()
+    req = urllib.request.Request(f"{BASE_URL}{path}", headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 def test_health():
@@ -131,8 +156,10 @@ import asyncio
 import websockets
 
 async def async_test_pty():
-    uri = "ws://localhost:5004/ws/pty"
-    async with websockets.connect(uri) as ws:
+    ws_base = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
+    uri = f"{ws_base}/ws/pty"
+    extra_headers = [("Authorization", f"Bearer {AUTH_TOKEN}")] if AUTH_TOKEN else []
+    async with websockets.connect(uri, extra_headers=extra_headers) as ws:
         # 1. Send window resize event
         resize_msg = json.dumps({"type": "resize", "cols": 100, "rows": 30})
         await ws.send(resize_msg)
@@ -164,7 +191,7 @@ def test_exec_streaming():
             "command": "for i in 1 2 3; do echo Chunk-$i; sleep 0.05; done",
             "stream": True
         }).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
+        headers=_auth_headers({"Content-Type": "application/json"}),
     )
     chunks = []
     with urllib.request.urlopen(req, timeout=10) as resp:
