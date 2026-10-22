@@ -6,6 +6,10 @@ metadata:
 data:
   squid.conf: |
     http_port 3128
+    pinger_enable off
+    logfile_rotate 0
+    access_log stdio:/dev/stdout
+    cache_log /dev/stderr
 
     acl SSL_ports port 443
     acl Safe_ports port 80
@@ -100,6 +104,8 @@ spec:
               mountPath: /var/spool/squid
             - name: squid-run
               mountPath: /run
+            - name: squid-log
+              mountPath: /var/log/squid
           resources:
             requests:
               cpu: "100m"
@@ -114,6 +120,8 @@ spec:
         - name: squid-cache
           emptyDir: {}
         - name: squid-run
+          emptyDir: {}
+        - name: squid-log
           emptyDir: {}
 ---
 apiVersion: v1
