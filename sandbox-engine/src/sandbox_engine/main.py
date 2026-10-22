@@ -185,7 +185,7 @@ async def livez():
 @app.get("/healthz", tags=["System"])
 async def healthz():
     """System health check: returns component status without requiring tenant auth."""
-    if _is_prod:
+    if settings.environment.lower() in ("production", "prod"):
         # Resolves L3: Minimal health probe in production to prevent information disclosure
         return {"status": "healthy"}
 

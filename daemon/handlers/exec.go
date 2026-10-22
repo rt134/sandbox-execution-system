@@ -178,6 +178,14 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 		streamOutput(stderrPipe, "stderr")
 	}()
 
+	// Resolves M4: Run cmd.Wait() concurrently so that when the main command exits,
+	// Go's cmd.WaitDelay (250ms) closes pipes even if background children inherited stdout/stderr,
+	// preventing the stream from hanging until the full context timeout.
+	waitErrChan := make(chan error, 1)
+	go func() {
+		waitErrChan <- cmd.Wait()
+	}()
+
 	// Unblock pipe readers if execution times out or context is cancelled
 	pipeCloseDone := make(chan struct{})
 	go func() {
@@ -189,10 +197,10 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 		}
 	}()
 
-	// Wait for pipe readers to complete BEFORE calling cmd.Wait() to prevent races
+	// Wait for pipe readers to complete (either via EOF, WaitDelay pipe closure, or timeout)
 	wg.Wait()
 	close(pipeCloseDone)
-	execErr := cmd.Wait()
+	execErr := <-waitErrChan
 
 	exitCode := 0
 	var errMsg string

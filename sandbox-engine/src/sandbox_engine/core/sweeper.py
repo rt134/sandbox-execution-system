@@ -66,25 +66,29 @@ class Sweeper:
     async def sweep_once(self):
         """
         Perform a single reconciliation sweep.
-        Resolves M7: Uses a PostgreSQL advisory lock for leader election across engine replicas,
-        preventing N_replicas * S_sessions load amplification against the K8s API server.
+        Resolves N4:
+        1. Always register engine heartbeat FIRST on every tick, BEFORE attempting leader acquisition,
+           ensuring live replicas never miss heartbeats or have warm pods falsely reaped.
+        2. Uses a TTL-based sweeper leader election (15s lease) rather than per-tick try_lock,
+           ensuring only one replica executes the sweep loop and eliminating multi-replica
+           load amplification against K8s API server.
         """
-        pg_pool = getattr(self.lease_manager.backend, "_pool", None)
-        if pg_pool:
-            try:
-                async with pg_pool.acquire() as conn:
-                    acquired = await conn.fetchval("SELECT pg_try_advisory_lock(847291)")
-                    if not acquired:
-                        logger.debug("Another engine replica holds the sweeper leader lock. Skipping sweep.")
-                        return
-                    try:
-                        await self._do_sweep()
-                    finally:
-                        await conn.execute("SELECT pg_advisory_unlock(847291)")
-            except Exception as e:
-                logger.error(f"Error acquiring/executing sweeper leader lock: {e}")
-        else:
-            await self._do_sweep()
+        current_engine_id = self.warm_pool.engine_id if self.warm_pool else settings.engine_instance_id
+        try:
+            await self.lease_manager.register_engine_heartbeat(current_engine_id)
+        except Exception as e:
+            logger.warning(f"Failed to register engine heartbeat for {current_engine_id}: {e}")
+
+        # TTL Leader Election: Only the elected leader replica performs the sweep
+        try:
+            is_leader = await self.lease_manager.try_acquire_sweeper_leader(current_engine_id, ttl_seconds=15.0)
+            if not is_leader:
+                logger.debug("Another engine replica holds the sweeper leader lease. Skipping sweep.")
+                return
+        except Exception as e:
+            logger.warning(f"Error checking sweeper leader lease, falling back: {e}")
+
+        await self._do_sweep()
 
     async def _do_sweep(self):
         """Internal sweep execution."""
@@ -108,7 +112,8 @@ class Sweeper:
                     await self.lease_manager.release_workspace_lock(
                         lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
                     )
-                await self.lease_manager.mark_expired(lease.session_id)
+                # Resolves N3 & M9: only transition to expired from 'reclaiming'
+                await self.lease_manager.mark_expired(lease.session_id, from_status="reclaiming")
 
         # 2. Reconcile any orphaned workspace locks
         await self.lease_manager.cleanup_expired_workspace_locks()
@@ -122,18 +127,19 @@ class Sweeper:
                     alive = await self.driver.is_alive(lease.sandbox_id)
                     if not alive:
                         logger.warning(f"🧹 [Sweeper] Detected dead/missing container '{lease.sandbox_id}' for active session '{lease.session_id}'. Reconciling...")
-                        await self.lease_manager.mark_expired(lease.session_id)
-                        if lease.workspace_id:
-                            await self.lease_manager.release_workspace_lock(
-                                lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
-                            )
-                        SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
+                        # Resolves N3: explicitly expire from 'active' status so quota and ledger are freed
+                        marked = await self.lease_manager.mark_expired(lease.session_id, from_status="active")
+                        if marked:
+                            if lease.workspace_id:
+                                await self.lease_manager.release_workspace_lock(
+                                    lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
+                                )
+                            SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
                 except Exception as e:
                     logger.error(f"Failed to check liveness of container {lease.sandbox_id}: {e}")
 
-        # 4. Engine Heartbeat & Dead Engine Warm Container Garbage Collection
+        # 4. Dead Engine Warm Container Garbage Collection
         current_engine_id = self.warm_pool.engine_id if self.warm_pool else settings.engine_instance_id
-        await self.lease_manager.register_engine_heartbeat(current_engine_id)
 
         try:
             dead_engines = await self.lease_manager.get_dead_engines(max_idle_sec=60.0)

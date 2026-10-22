@@ -41,8 +41,14 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # 2. Kubernetes API Server (for managing sandbox pods, PVCs, and runtime classes)
-    - ports:
+    # 2. Kubernetes API Server (restricted to cluster API endpoint; operators targeting external control planes should configure specific CIDRs)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: default
+        - ipBlock:
+            cidr: 10.96.0.1/32
+      ports:
         - protocol: TCP
           port: 443
         - protocol: TCP
@@ -64,15 +70,15 @@ spec:
         - protocol: TCP
           port: 3128
     # 5. Database (PostgreSQL) and Cache (Redis)
+    # Resolves N8: Restricted strictly to in-cluster database pods. (Removed open 0.0.0.0/0).
+    # For external managed databases (e.g. AWS RDS/Cloud SQL), specify your exact private VPC CIDR block.
     - to:
         - namespaceSelector: {}
           podSelector:
-            matchLabels:
-              app: postgres
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              - 169.254.169.254/32
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["postgres", "postgresql", "redis"]
       ports:
         - protocol: TCP
           port: 5432

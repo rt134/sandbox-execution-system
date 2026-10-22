@@ -50,7 +50,7 @@ class LeaseBackend(ABC):
         pass
 
     @abstractmethod
-    async def mark_expired(self, session_id: str) -> None:
+    async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         pass
 
     @abstractmethod
@@ -137,6 +137,10 @@ class LeaseBackend(ABC):
     async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
         pass
 
+    @abstractmethod
+    async def try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float = 15.0) -> bool:
+        pass
+
 
 class SQLiteLeaseBackend(LeaseBackend):
     def __init__(self, db_path: str):
@@ -201,6 +205,15 @@ class SQLiteLeaseBackend(LeaseBackend):
                 CREATE TABLE IF NOT EXISTS engine_instances (
                     engine_id TEXT PRIMARY KEY,
                     last_heartbeat REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sweeper_leader (
+                    lock_id INTEGER PRIMARY KEY DEFAULT 1,
+                    leader_id TEXT NOT NULL,
+                    expires_at REAL NOT NULL
                 )
                 """
             )
@@ -354,23 +367,33 @@ class SQLiteLeaseBackend(LeaseBackend):
         async with self._lock:
             return await asyncio.to_thread(self._sync_update_status, session_id, "released")
 
-    async def mark_expired(self, session_id: str) -> None:
+    async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         async with self._lock:
-            await asyncio.to_thread(self._sync_update_status, session_id, "expired")
+            return await asyncio.to_thread(self._sync_mark_expired, session_id, from_status)
 
-    def _sync_update_status(self, session_id: str, status: str) -> bool:
+    def _sync_mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         with sqlite3.connect(self.db_path) as conn:
-            # Resolves M9: only expire leases that are in 'reclaiming' state to avoid overwriting re-acquired leases
-            if status == "expired":
+            # Resolves N3: If from_status is specified ('reclaiming' or 'active'), only match that status.
+            # If not specified, match any active or reclaiming lease to mark expired.
+            if from_status:
                 cursor = conn.execute(
-                    "UPDATE leases SET status = ? WHERE session_id = ? AND status = 'reclaiming'",
-                    (status, session_id),
+                    "UPDATE leases SET status = 'expired' WHERE session_id = ? AND status = ?",
+                    (session_id, from_status),
                 )
             else:
                 cursor = conn.execute(
-                    "UPDATE leases SET status = ? WHERE session_id = ?",
-                    (status, session_id),
+                    "UPDATE leases SET status = 'expired' WHERE session_id = ? AND status IN ('active', 'reclaiming')",
+                    (session_id,),
                 )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def _sync_update_status(self, session_id: str, status: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE leases SET status = ? WHERE session_id = ?",
+                (status, session_id),
+            )
             conn.commit()
             return cursor.rowcount > 0
 
@@ -656,6 +679,33 @@ class SQLiteLeaseBackend(LeaseBackend):
             conn.execute("DELETE FROM engine_instances WHERE last_heartbeat < ?", (stale_engine_cutoff,))
             conn.commit()
 
+    async def try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float = 15.0) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_try_acquire_sweeper_leader, engine_id, ttl_seconds)
+
+    def _sync_try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float) -> bool:
+        now = time.time()
+        new_expires = now + ttl_seconds
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT leader_id, expires_at FROM sweeper_leader WHERE lock_id = 1")
+            row = cursor.fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO sweeper_leader (lock_id, leader_id, expires_at) VALUES (1, ?, ?)",
+                    (engine_id, new_expires),
+                )
+                conn.commit()
+                return True
+            curr_leader, curr_expires = row
+            if curr_leader == engine_id or curr_expires < now:
+                conn.execute(
+                    "UPDATE sweeper_leader SET leader_id = ?, expires_at = ? WHERE lock_id = 1",
+                    (engine_id, new_expires),
+                )
+                conn.commit()
+                return True
+            return False
+
 
 class RedisLeaseBackend(LeaseBackend):
     def __init__(self, redis_client):
@@ -774,8 +824,21 @@ class RedisLeaseBackend(LeaseBackend):
                 )
         return expired
 
-    async def mark_expired(self, session_id: str) -> None:
+    async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         await self.redis.srem("leases:active", session_id)
+        raw = await self.redis.get(f"lease:{session_id}")
+        if raw:
+            try:
+                data = json.loads(raw)
+                curr_status = data.get("status")
+                if from_status is None or curr_status == from_status or curr_status in ("active", "reclaiming"):
+                    data["status"] = "expired"
+                    await self.redis.set(f"lease:{session_id}", json.dumps(data))
+                    return True
+                return False
+            except Exception:
+                pass
+        return True
 
     async def list_active_leases(self) -> List[LeaseRecord]:
         active_ids = await self.redis.smembers("leases:active")
@@ -911,6 +974,18 @@ class RedisLeaseBackend(LeaseBackend):
     async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
         await self.cleanup_expired_workspace_locks()
 
+    async def try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float = 15.0) -> bool:
+        key = "sweeper:leader"
+        acquired = await self.redis.set(key, engine_id, nx=True, ex=int(ttl_seconds))
+        if acquired:
+            return True
+        curr = await self.redis.get(key)
+        curr_str = curr.decode("utf-8") if isinstance(curr, bytes) else str(curr) if curr else ""
+        if curr_str == engine_id:
+            await self.redis.expire(key, int(ttl_seconds))
+            return True
+        return False
+
 
 class PostgresLeaseBackend(LeaseBackend):
     """
@@ -1008,6 +1083,12 @@ class PostgresLeaseBackend(LeaseBackend):
                     last_heartbeat DOUBLE PRECISION NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_engine_heartbeat ON engine_instances(last_heartbeat);
+
+                CREATE TABLE IF NOT EXISTS sweeper_leader (
+                    lock_id INT PRIMARY KEY DEFAULT 1,
+                    leader_id VARCHAR(128) NOT NULL,
+                    expires_at DOUBLE PRECISION NOT NULL
+                );
                 """
             )
 
@@ -1179,13 +1260,21 @@ class PostgresLeaseBackend(LeaseBackend):
                 for r in rows
             ]
 
-    async def mark_expired(self, session_id: str) -> None:
+    async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         async with self._pool.acquire() as conn:
-            # Resolves M9: only transition to expired if currently in 'reclaiming' to protect re-acquired active leases
-            row = await conn.fetchrow(
-                "UPDATE leases SET status = 'expired' WHERE session_id = $1 AND status = 'reclaiming' RETURNING workspace_id",
-                session_id,
-            )
+            # Resolves N3: If from_status is specified ('reclaiming' or 'active'), only match that status.
+            # If not specified, match any active or reclaiming lease to mark expired.
+            if from_status:
+                row = await conn.fetchrow(
+                    "UPDATE leases SET status = 'expired' WHERE session_id = $1 AND status = $2 RETURNING workspace_id",
+                    session_id,
+                    from_status,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE leases SET status = 'expired' WHERE session_id = $1 AND status IN ('active', 'reclaiming') RETURNING workspace_id",
+                    session_id,
+                )
             if row:
                 ws_id = row["workspace_id"]
                 await conn.execute("DELETE FROM workspace_locks WHERE workspace_id = $1 AND session_id = $2", ws_id, session_id)
@@ -1195,6 +1284,8 @@ class PostgresLeaseBackend(LeaseBackend):
                     ws_id,
                     time.time(),
                 )
+                return True
+            return False
 
     async def list_active_leases(self) -> List[LeaseRecord]:
         now = time.time()
@@ -1432,6 +1523,23 @@ class PostgresLeaseBackend(LeaseBackend):
             await conn.execute("DELETE FROM session_audit_logs WHERE created_at < $1", cutoff)
             await conn.execute("DELETE FROM engine_instances WHERE last_heartbeat < $1", stale_engine_cutoff)
 
+    async def try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float = 15.0) -> bool:
+        now = time.time()
+        new_expires = now + ttl_seconds
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                INSERT INTO sweeper_leader (lock_id, leader_id, expires_at)
+                VALUES (1, $1, $2)
+                ON CONFLICT (lock_id) DO UPDATE
+                SET leader_id = $1, expires_at = $2
+                WHERE sweeper_leader.leader_id = $1 OR sweeper_leader.expires_at < $3
+                RETURNING leader_id;
+                """,
+                engine_id, new_expires, now,
+            )
+            return bool(row == engine_id)
+
 
 class LeaseManager:
     """
@@ -1561,8 +1669,8 @@ class LeaseManager:
                 workspace_id=workspace_id,
             )
 
-    async def mark_expired(self, session_id: str) -> None:
-        await self._backend.mark_expired(session_id)
+    async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
+        return await self._backend.mark_expired(session_id, from_status=from_status)
 
     async def list_active(self) -> List[LeaseRecord]:
         return await self._backend.list_active_leases()
@@ -1641,3 +1749,8 @@ class LeaseManager:
     async def prune_database_records(self, retention_seconds: float = 86400.0 * 7) -> None:
         if hasattr(self._backend, "prune_database_records"):
             await self._backend.prune_database_records(retention_seconds)
+
+    async def try_acquire_sweeper_leader(self, engine_id: str, ttl_seconds: float = 15.0) -> bool:
+        if hasattr(self._backend, "try_acquire_sweeper_leader"):
+            return await self._backend.try_acquire_sweeper_leader(engine_id, ttl_seconds=ttl_seconds)
+        return True

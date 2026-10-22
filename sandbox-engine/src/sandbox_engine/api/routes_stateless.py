@@ -60,9 +60,16 @@ async def run_stateless_code(
         # 1. Grab a pre-warmed sandbox (<1ms)
         try:
             instance = await warm_pool.acquire(timeout=settings.warm_pool_acquire_timeout)
+        except HTTPException as e:
+            STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="pool_exhausted").inc()
+            raise e
         except Exception as e:
             STATELESS_RUNS_TOTAL.labels(language=metric_lang, status="pool_exhausted").inc()
-            raise HTTPException(status_code=503, detail=f"No available warm sandbox: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"No available warm sandbox: {e}",
+                headers={"Retry-After": "2"},
+            )
         # 2. Direct HTTP dispatch to shellctl inside container with internal auth
         timeout_client = httpx.Timeout(payload.timeout + 2.0, connect=1.0)
         headers = {}

@@ -17,7 +17,7 @@ dependencies = [
     "docker>=7.0.0,<8.0.0",
     "kubernetes-asyncio>=33.0.0,<34.0.0",
     "asyncpg>=0.29.0,<0.31.0",
-    "cryptography>=42.0.0,<44.0.0",
+    "cryptography>=42.0.0,<46.0.0",
     "prometheus-client>=0.19.0,<1.0.0",
 ]
 

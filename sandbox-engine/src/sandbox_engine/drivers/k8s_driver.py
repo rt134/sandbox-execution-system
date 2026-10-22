@@ -31,6 +31,26 @@ def normalize_k8s_mem(mem: str) -> str:
     return mem
 
 
+_DNS_CACHE: dict[str, tuple[str, float]] = {}
+
+
+async def _resolve_host_ip_async(host: str, ttl_seconds: float = 300.0) -> Optional[str]:
+    """Resolves a hostname to an IP address asynchronously without blocking the event loop (N7)."""
+    now = time.time()
+    cached = _DNS_CACHE.get(host)
+    if cached and (now - cached[1] < ttl_seconds):
+        return cached[0]
+    try:
+        ip = await asyncio.to_thread(socket.gethostbyname, host)
+        _DNS_CACHE[host] = (ip, now)
+        return ip
+    except Exception as e:
+        if cached:
+            return cached[0]
+        logger.warning("Could not resolve host '%s' for host_aliases: %s", host, e)
+        return None
+
+
 class KubernetesDriver(ContainerDriver):
     """
     Production-hardened Kubernetes driver for cloud-native clusters.
@@ -79,24 +99,27 @@ class KubernetesDriver(ContainerDriver):
         ]
         node_selector = {settings.k8s_node_selector_key: settings.k8s_node_selector_value}
 
-        # Resolves H2: Sandboxes have no direct DNS egress to prevent DNS tunneling exfiltration.
-        # Inject host_aliases for Squid proxy hostname so sandboxes resolve the proxy via /etc/hosts
+        # Resolves H2 & N7: Sandboxes have no direct DNS egress to prevent DNS tunneling exfiltration.
+        # Inject host_aliases for Squid proxy hostnames resolved asynchronously via asyncio.to_thread with caching
         host_aliases = []
-        if settings.http_proxy:
-            match = re.search(r"https?://([^:/]+)", settings.http_proxy)
-            if match:
-                proxy_host = match.group(1)
-                if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", proxy_host):
-                    try:
-                        resolved_ip = socket.gethostbyname(proxy_host)
-                        host_aliases.append(
-                            client.V1HostAlias(
-                                ip=resolved_ip,
-                                hostnames=[proxy_host],
-                            )
-                        )
-                    except Exception as e:
-                        logger.warning("Could not resolve proxy host '%s' for host_aliases: %s", proxy_host, e)
+        hosts_to_resolve = set()
+        for proxy_url in (settings.http_proxy, settings.https_proxy):
+            if proxy_url:
+                match = re.search(r"https?://([^:/]+)", proxy_url)
+                if match:
+                    phost = match.group(1)
+                    if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", phost):
+                        hosts_to_resolve.add(phost)
+
+        for phost in hosts_to_resolve:
+            resolved_ip = await _resolve_host_ip_async(phost)
+            if resolved_ip:
+                host_aliases.append(
+                    client.V1HostAlias(
+                        ip=resolved_ip,
+                        hostnames=[phost],
+                    )
+                )
 
         # Container environment
         container_env = [

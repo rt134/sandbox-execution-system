@@ -65,17 +65,23 @@ async def test_admission_non_raising_503_m2():
 
 @pytest.mark.asyncio
 async def test_mark_expired_protects_reacquired_lease_m9(tmp_path):
-    """Verify that mark_expired only expires leases in 'reclaiming' status, protecting active re-acquired leases (M9)."""
+    """Verify that mark_expired with from_status='reclaiming' protects active re-acquired leases (M9)."""
     db_file = str(tmp_path / "test_leases.db")
     backend = SQLiteLeaseBackend(db_path=db_file)
-    await backend.initialize()
 
     # 1. Create a lease in active status
-    lease = await backend.acquire_lease("session-test-m9", workspace_id="ws-1", ttl_seconds=60)
+    lease = await backend.create_or_renew_lease(
+        session_id="session-test-m9",
+        workspace_id="ws-1",
+        sandbox_id="sbx-1",
+        endpoint="http://127.0.0.1:5004",
+        ttl_seconds=60,
+    )
     assert lease.status == "active"
 
-    # 2. mark_expired directly on active lease should NOT transition it (only 'reclaiming' can be expired)
-    await backend.mark_expired("session-test-m9")
+    # 2. mark_expired with from_status='reclaiming' on active lease should NOT transition it (only 'reclaiming' can be expired)
+    marked = await backend.mark_expired("session-test-m9", from_status="reclaiming")
+    assert marked is False
     current = await backend.get_lease("session-test-m9")
     assert current is not None
     assert current.status == "active"
@@ -86,9 +92,113 @@ async def test_mark_expired_protects_reacquired_lease_m9(tmp_path):
     assert current_reclaiming.status == "reclaiming"
 
     # 4. mark_expired on reclaiming lease MUST successfully mark it expired
-    await backend.mark_expired("session-test-m9")
+    marked_rec = await backend.mark_expired("session-test-m9", from_status="reclaiming")
+    assert marked_rec is True
     expired = await backend.get_lease("session-test-m9")
     assert expired.status == "expired"
+
+
+@pytest.mark.asyncio
+async def test_sweeper_dead_container_reconciliation_and_leader_election_n3_n4(tmp_path):
+    """Verify that sweeper reconciles dead containers (N3) and respects TTL leader election (N4)."""
+    from sandbox_engine.core.sweeper import Sweeper
+    from unittest.mock import AsyncMock
+
+    db_file = str(tmp_path / "test_sweeper.db")
+    backend = SQLiteLeaseBackend(db_path=db_file)
+    lease_mgr = LeaseManager(backend=backend)
+
+    # Create one dead container lease and one live container lease
+    await backend.create_or_renew_lease(
+        session_id="session-dead-1",
+        workspace_id="ws-dead",
+        sandbox_id="sbx-dead",
+        endpoint="http://127.0.0.1:5001",
+        ttl_seconds=300,
+    )
+    await backend.create_or_renew_lease(
+        session_id="session-live-1",
+        workspace_id="ws-live",
+        sandbox_id="sbx-live",
+        endpoint="http://127.0.0.1:5002",
+        ttl_seconds=300,
+    )
+
+    # Acquire workspace lock for dead session
+    await backend.acquire_workspace_lock("ws-dead", "session-dead-1", ttl_seconds=300)
+
+    # Mock driver where sbx-dead is dead and sbx-live is alive
+    mock_driver = AsyncMock()
+    async def mock_is_alive(sandbox_id: str) -> bool:
+        return sandbox_id == "sbx-live"
+    mock_driver.is_alive.side_effect = mock_is_alive
+
+    sweeper = Sweeper(driver=mock_driver, lease_manager=lease_mgr, interval_sec=1.0)
+    await sweeper.sweep_once()
+
+    # Dead session must be marked 'expired' (N3) and its lock released
+    dead_lease = await backend.get_lease("session-dead-1")
+    assert dead_lease.status == "expired"
+    lock = await backend.get_workspace_lock("ws-dead")
+    assert lock is None
+
+    # Live session must still be 'active'
+    live_lease = await backend.get_lease("session-live-1")
+    assert live_lease.status == "active"
+
+    # Leader election test (N4): Engine 1 holds lease, Engine 2 is denied until expiry
+    assert await lease_mgr.try_acquire_sweeper_leader("engine-1", ttl_seconds=15.0) is True
+    assert await lease_mgr.try_acquire_sweeper_leader("engine-2", ttl_seconds=15.0) is False
+    # Engine 1 renewal succeeds
+    assert await lease_mgr.try_acquire_sweeper_leader("engine-1", ttl_seconds=15.0) is True
+
+
+@pytest.mark.asyncio
+async def test_auth_api_key_only_and_tenant_keys_validation_n1_n2():
+    """Verify that config validation works with tenant-keys only (N1) and api-key-only auth works (N2)."""
+    from sandbox_engine.core.security import authenticate_tenant_credentials
+    from sandbox_engine.config import SandboxSettings
+
+    # N1: Validation does not crash with UnboundLocalError when api_key is None
+    cfg = SandboxSettings(
+        environment="production",
+        tenant_keys_json='{"tenant-1": "0123456789abcdef0123456789abcdef"}',
+        api_key=None,
+        encryption_key="a" * 32,
+        postgres_url="postgresql://sandbox:sandbox@localhost:5432/sandbox",
+    )
+    # validate_production_settings must execute without UnboundLocalError
+    cfg.validate_production_settings()
+
+    # N2: API-key-only auth does not return 500 when valid key is provided
+    orig_env = settings.environment
+    orig_key = settings.api_key
+    orig_tenant_keys = settings.tenant_keys_json
+    try:
+        settings.environment = "production"
+        settings.api_key = "0123456789abcdef0123456789abcdef"
+        settings.tenant_keys_json = None
+
+        # Correct API key authentication succeeds without 500
+        tid = await authenticate_tenant_credentials(
+            auth_header=f"Bearer {settings.api_key}",
+            raw_tenant="custom-tenant",
+            enforce_rate_limit=False,
+        )
+        assert tid == "custom-tenant"
+
+        # Invalid key returns 401
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticate_tenant_credentials(
+                auth_header="Bearer wrong-key-value",
+                raw_tenant="custom-tenant",
+                enforce_rate_limit=False,
+            )
+        assert exc_info.value.status_code == 401
+    finally:
+        settings.environment = orig_env
+        settings.api_key = orig_key
+        settings.tenant_keys_json = orig_tenant_keys
 
 
 @pytest.mark.asyncio

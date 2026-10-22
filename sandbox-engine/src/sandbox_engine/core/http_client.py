@@ -23,7 +23,7 @@ async def request_with_byte_cap(
 ) -> Tuple[bytes, int, Dict[str, str]]:
     cap = max_bytes if max_bytes is not None else settings.max_response_bytes
     headers = headers or {}
-    async with asyncio.timeout(timeout_seconds):
+    try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds), limits=DEFAULT_LIMITS) as client:
             async with client.stream(method, url, json=json, params=params, headers=headers) as resp:
                 chunks: list[bytes] = []
@@ -35,6 +35,8 @@ async def request_with_byte_cap(
                     chunks.append(chunk)
                 body = b"".join(chunks)
                 return body, resp.status_code, dict(resp.headers)
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Gateway Timeout: sandbox request timed out")
 
 
 async def stream_response_bytes(

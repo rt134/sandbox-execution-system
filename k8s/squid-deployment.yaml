@@ -41,9 +41,16 @@ data:
     http_access deny rfc4291_linklocal
     http_access deny cloud_meta_v6
 
-    # Restrict allowed package registries (PyPI and npm). GitHub & HuggingFace dropped to block exfiltration
+    # Resolves H4: Explicitly block package upload/publishing domains to close exfiltration channels
+    acl upload_domains dstdomain upload.pypi.org
+    http_access deny upload_domains
+
+    # Restrict allowed package registries to exact download hostnames (no wildcards like .pypi.org)
+    # Architecture Note (H4): In production without TLS interception, sandboxes should point PIP_INDEX_URL 
+    # and NPM_CONFIG_REGISTRY to an internal in-cluster GET-only mirror (devpi/Verdaccio) on plain HTTP 
+    # so that HTTP methods (GET/HEAD only) are strictly enforced at the proxy/mirror level.
     acl read_methods method GET HEAD
-    acl package_domains dstdomain .pypi.org .pythonhosted.org .npmjs.org .npmjs.com .registry.npmjs.org
+    acl package_domains dstdomain pypi.org files.pythonhosted.org registry.npmjs.org
     http_access allow CONNECT SSL_ports package_domains
     http_access allow read_methods package_domains
     http_access deny all

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -74,14 +75,27 @@ func getWorkspaceDiskQuota() int64 {
 }
 
 var (
+	usageMu         sync.RWMutex
 	usageCacheBytes int64
 	usageCacheAt    time.Time
 )
 
 func getWorkspaceDiskUsage() int64 {
+	usageMu.RLock()
+	if time.Since(usageCacheAt) < 2*time.Second {
+		bytes := usageCacheBytes
+		usageMu.RUnlock()
+		return bytes
+	}
+	usageMu.RUnlock()
+
+	usageMu.Lock()
+	defer usageMu.Unlock()
+	// Re-check timestamp under write lock
 	if time.Since(usageCacheAt) < 2*time.Second {
 		return usageCacheBytes
 	}
+
 	root := getWorkspaceRoot()
 	var totalSize int64
 	_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
