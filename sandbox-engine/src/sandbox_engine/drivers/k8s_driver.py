@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import socket
 import time
@@ -188,8 +189,16 @@ class KubernetesDriver(ContainerDriver):
             seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
 
-        # Resolves H1: Pin by digest uses IfNotPresent; mutable tags (:latest) pull Always to avoid stale-cache risks
-        pull_policy = "IfNotPresent" if ("@" in spec.image or not spec.image.endswith(":latest")) else "Always"
+        # Resolves H1: Pin by digest uses IfNotPresent; mutable tags (:latest) pull Always in prod, or IfNotPresent locally
+        if (
+            settings.environment.lower() != "production"
+            or "@" in spec.image
+            or not spec.image.endswith(":latest")
+            or os.environ.get("SANDBOX_K8S_IMAGE_PULL_POLICY") == "IfNotPresent"
+        ):
+            pull_policy = "IfNotPresent"
+        else:
+            pull_policy = "Always"
 
         container = client.V1Container(
             name="sandbox-kernel",
@@ -213,13 +222,22 @@ class KubernetesDriver(ContainerDriver):
             ),
         )
 
+        runtime_class = settings.k8s_runtime_class
+        if runtime_class and runtime_class.lower() in ("none", "runc", ""):
+            runtime_class = None
+
         pod_spec_kwargs = dict(
-            runtime_class_name=settings.k8s_runtime_class,
+            runtime_class_name=runtime_class,
             tolerations=tolerations,
             node_selector=node_selector,
             automount_service_account_token=False,
             enable_service_links=False,
-            security_context=client.V1PodSecurityContext(fs_group=1000, run_as_group=1000),
+            security_context=client.V1PodSecurityContext(
+                run_as_non_root=True,
+                run_as_user=1000,
+                run_as_group=1000,
+                fs_group=1000,
+            ),
             containers=[container],
             volumes=pod_volumes if pod_volumes else None,
             restart_policy="Never",
