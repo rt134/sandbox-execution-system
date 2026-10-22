@@ -79,8 +79,8 @@ class Sweeper:
         except Exception as e:
             logger.warning(f"Failed to register engine heartbeat for {current_engine_id}: {e}")
 
-        # TTL Leader Election: Only the elected leader replica performs the sweep
-        if not force and settings.environment.lower() not in ("test", "testing"):
+        # TTL Leader Election: Only enforce single-leader lock during background loop in multi-replica production mode
+        if not force and self._running and settings.environment.lower() in ("production", "prod"):
             try:
                 is_leader = await self.lease_manager.try_acquire_sweeper_leader(current_engine_id, ttl_seconds=15.0)
                 if not is_leader:
