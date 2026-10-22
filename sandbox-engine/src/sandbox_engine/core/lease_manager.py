@@ -360,10 +360,17 @@ class SQLiteLeaseBackend(LeaseBackend):
 
     def _sync_update_status(self, session_id: str, status: str) -> bool:
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "UPDATE leases SET status = ? WHERE session_id = ?",
-                (status, session_id),
-            )
+            # Resolves M9: only expire leases that are in 'reclaiming' state to avoid overwriting re-acquired leases
+            if status == "expired":
+                cursor = conn.execute(
+                    "UPDATE leases SET status = ? WHERE session_id = ? AND status = 'reclaiming'",
+                    (status, session_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE leases SET status = ? WHERE session_id = ?",
+                    (status, session_id),
+                )
             conn.commit()
             return cursor.rowcount > 0
 
@@ -1174,7 +1181,11 @@ class PostgresLeaseBackend(LeaseBackend):
 
     async def mark_expired(self, session_id: str) -> None:
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow("UPDATE leases SET status = 'expired' WHERE session_id = $1 RETURNING workspace_id", session_id)
+            # Resolves M9: only transition to expired if currently in 'reclaiming' to protect re-acquired active leases
+            row = await conn.fetchrow(
+                "UPDATE leases SET status = 'expired' WHERE session_id = $1 AND status = 'reclaiming' RETURNING workspace_id",
+                session_id,
+            )
             if row:
                 ws_id = row["workspace_id"]
                 await conn.execute("DELETE FROM workspace_locks WHERE workspace_id = $1 AND session_id = $2", ws_id, session_id)

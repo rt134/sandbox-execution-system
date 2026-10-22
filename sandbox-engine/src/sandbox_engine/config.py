@@ -42,16 +42,22 @@ class EngineSettings(BaseSettings):
     max_session_lifetime: int = 7200  # Absolute cap from session created_at
     max_stateless_timeout: float = 60.0  # Max 60 seconds execution timeout
     max_concurrent_sessions_per_tenant: int = 10  # Max active sessions per tenant
+    max_stateless_per_tenant: int = 10  # Max concurrent stateless runs per tenant
     max_workspaces_per_tenant: int = 20  # Distinct workspace_ids per tenant (PVC cap guard)
     rate_limit_requests_per_minute: int = 120  # Rate limit per tenant
 
     # Pool Configurations (Stateless)
     warm_pool_size: int = 2
     warm_pool_acquire_timeout: float = 5.0
+    max_on_demand_spawns: int = 4  # Cap concurrent on-demand spawns when warm pool is empty
     max_concurrent_spawns: int = 10  # Cap concurrent container launches
     max_global_sessions: int = 250
     max_in_flight_requests: int = 100
     metrics_port: int = 9090
+
+    # Retention & Storage Management
+    workspace_retention_seconds: float = 86400.0  # 24 hours retention for inactive workspaces
+    docker_remove_workspace_on_expiry: bool = False  # If True, delete workspace dir on lease expiry in Docker
 
     # Environment & Persistence (PostgreSQL)
     environment: str = os.environ.get("ENV", os.environ.get("ENVIRONMENT", "production"))
@@ -131,38 +137,44 @@ class EngineSettings(BaseSettings):
         self.validate_environment_name()
         self.validate_tenant_keys_json()
         if self.environment.lower() in ("production", "prod"):
-            if not self.tenant_keys_json:
+            if not self.tenant_keys_json and not self.api_key:
                 raise ValueError(
-                    "Production requires SANDBOX_TENANT_KEYS_JSON mapping tenant_id to API keys."
-                )
-            # 1. API Key Validation
-            if not self.api_key:
-                raise ValueError(
-                    "Production environment requires SANDBOX_API_KEY to be set! "
+                    "Production requires either SANDBOX_TENANT_KEYS_JSON or SANDBOX_API_KEY to be set! "
                     "Refusing to start engine in fail-open unauthenticated mode."
                 )
-            if len(self.api_key) < 32:
-                raise ValueError(
-                    f"Production SANDBOX_API_KEY is too short ({len(self.api_key)} chars). Must be at least 32 characters."
-                )
-            weak_patterns = [
-                "change-in-prod",
-                "replace-me",
-                "replace-in-prod",
-                "default-secret",
-                "secret-key",
-                "sandbox-default",
-                "default-sandbox",
-                "sandbox-secret",
-                "12345",
-                "password",
-                "admin",
-            ]
-            for wp in weak_patterns:
-                if wp in self.api_key.lower():
+            # 1. API Key Validation (if configured)
+            if self.api_key:
+                if len(self.api_key) < 32:
                     raise ValueError(
-                        f"Production SANDBOX_API_KEY contains known insecure placeholder '{wp}'. Must set a real secret."
+                        f"Production SANDBOX_API_KEY is too short ({len(self.api_key)} chars). Must be at least 32 characters."
                     )
+                weak_patterns = [
+                    "change-in-prod",
+                    "replace-me",
+                    "replace-in-prod",
+                    "default-secret",
+                    "secret-key",
+                    "sandbox-default",
+                    "default-sandbox",
+                    "sandbox-secret",
+                    "12345",
+                    "password",
+                    "admin",
+                ]
+                for wp in weak_patterns:
+                    if wp in self.api_key.lower():
+                        raise ValueError(
+                            f"Production SANDBOX_API_KEY contains known insecure placeholder '{wp}'. Must set a real secret."
+                        )
+
+            # 2. CORS Wildcard Check in Production
+            if self.cors_allowed_origins == ["*"]:
+                import warnings
+                warnings.warn(
+                    "Security Notice: SANDBOX_CORS_ALLOWED_ORIGINS is configured with wildcard '*' in production. "
+                    "Explicit origins should be configured for production deployments.",
+                    UserWarning,
+                )
 
             # 2. Encryption Key Validation
             if not self.encryption_key or len(self.encryption_key) < 32:

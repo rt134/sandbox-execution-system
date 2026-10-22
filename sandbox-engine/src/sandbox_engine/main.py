@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from .api.routes_sessions import router as sessions_router
 from .api.routes_stateless import router as stateless_router
 from .api.routes_ws import router as ws_router
 from .config import settings
-from .core.admission import acquire_in_flight, release_in_flight
+from .core.admission import try_acquire_in_flight, release_in_flight
 from .core.lease_manager import LeaseManager
 from .core.rate_limiter import rate_limiter
 from .core.sweeper import Sweeper
@@ -34,9 +37,9 @@ async def lifespan(app: FastAPI):
     lease_mgr = LeaseManager()
     await lease_mgr.initialize()
 
-    # 2. Initialize Stateless Warm Pool
+    # 2. Initialize Stateless Warm Pool in background task so server binds port immediately (resolves M1)
     warm_pool = WarmPoolManager(driver=driver, target_size=settings.warm_pool_size)
-    await warm_pool.start()
+    warm_pool_task = asyncio.create_task(warm_pool.start())
 
     # 3. Initialize Sweeper GC Loop (passing warm_pool for orphan cleanup)
     sweeper = Sweeper(
@@ -57,7 +60,10 @@ async def lifespan(app: FastAPI):
     if settings.enable_prometheus_metrics:
         from prometheus_client import start_http_server
 
-        start_http_server(settings.metrics_port)
+        try:
+            start_http_server(settings.metrics_port)
+        except OSError:
+            logger.warning(f"Prometheus metrics port {settings.metrics_port} already in use or cannot bind")
 
     app.state.driver = driver
     app.state.lease_manager = lease_mgr
@@ -70,6 +76,8 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down sandbox-engine...")
     await sweeper.stop()
     await warm_pool.stop()
+    if not warm_pool_task.done():
+        warm_pool_task.cancel()
     await lease_mgr.close()
 
 
@@ -94,16 +102,35 @@ app.add_middleware(
 )
 
 
+class PayloadTooLargeError(Exception):
+    """Raised when streaming or chunked payload exceeds max_request_size_bytes."""
+    pass
+
 
 @app.middleware("http")
 async def admission_and_size_limits(request: Request, call_next):
+    # Propagate or generate request ID (M10)
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+    request.state.request_id = request_id
+
     if request.url.path.startswith("/v1/"):
-        await acquire_in_flight()
+        # Resolves M2: Non-raising admission check returns 503 JSONResponse directly
+        if not await try_acquire_in_flight():
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"detail": "Server at capacity"},
+                headers={"Retry-After": "5", "X-Request-ID": request_id},
+            )
         try:
-            return await _limit_request_size(request, call_next)
+            response = await _limit_request_size(request, call_next)
+            response.headers["X-Request-ID"] = request_id
+            return response
         finally:
             await release_in_flight()
-    return await _limit_request_size(request, call_next)
+
+    response = await _limit_request_size(request, call_next)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 async def _limit_request_size(request: Request, call_next):
@@ -112,15 +139,14 @@ async def _limit_request_size(request: Request, call_next):
     if content_length:
         try:
             if int(content_length) > settings.max_request_size_bytes:
-                return Response(
-                    content='{"detail": "Request entity too large: payload exceeds 25MB limit"}',
-                    status_code=413,
-                    media_type="application/json",
+                return JSONResponse(
+                    content={"detail": "Request entity too large: payload exceeds 25MB limit"},
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 )
         except ValueError:
             pass
     else:
-        # Protect against chunked streaming memory bombs where Content-Length is omitted
+        # Resolves M2: count bytes in limited_receive and raise PayloadTooLargeError instead of returning Response in ASGI receive
         received_bytes = 0
         original_receive = request._receive
 
@@ -131,16 +157,18 @@ async def _limit_request_size(request: Request, call_next):
                 body_chunk = msg.get("body", b"")
                 received_bytes += len(body_chunk)
                 if received_bytes > settings.max_request_size_bytes:
-                    return Response(
-                        content='{"detail":"Request entity too large: streaming payload exceeds 25MB limit"}',
-                        status_code=413,
-                        media_type="application/json",
-                    )
+                    raise PayloadTooLargeError("Streaming payload exceeds limit")
             return msg
 
         request._receive = limited_receive
 
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    except PayloadTooLargeError:
+        return JSONResponse(
+            content={"detail": "Request entity too large: streaming payload exceeds 25MB limit"},
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        )
 
 
 app.include_router(stateless_router)
@@ -157,6 +185,10 @@ async def livez():
 @app.get("/healthz", tags=["System"])
 async def healthz():
     """System health check: returns component status without requiring tenant auth."""
+    if _is_prod:
+        # Resolves L3: Minimal health probe in production to prevent information disclosure
+        return {"status": "healthy"}
+
     driver_name = getattr(app.state, "driver", None).__class__.__name__ if hasattr(app.state, "driver") else "unknown"
     pool_size = app.state.warm_pool.queue.qsize() if hasattr(app.state, "warm_pool") else 0
     return {

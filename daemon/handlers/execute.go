@@ -88,6 +88,7 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 	cmd.WaitDelay = 250 * time.Millisecond
+	cmd.Env = scrubInheritedEnv()
 
 	// Prepare payload for runner
 	payloadBytes, _ := json.Marshal(map[string]interface{}{

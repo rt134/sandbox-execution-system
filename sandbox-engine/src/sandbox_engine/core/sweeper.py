@@ -64,7 +64,30 @@ class Sweeper:
                 logger.error(f"Unexpected error in sweeper loop: {e}", exc_info=True)
 
     async def sweep_once(self):
-        """Perform a single reconciliation sweep."""
+        """
+        Perform a single reconciliation sweep.
+        Resolves M7: Uses a PostgreSQL advisory lock for leader election across engine replicas,
+        preventing N_replicas * S_sessions load amplification against the K8s API server.
+        """
+        pg_pool = getattr(self.lease_manager.backend, "_pool", None)
+        if pg_pool:
+            try:
+                async with pg_pool.acquire() as conn:
+                    acquired = await conn.fetchval("SELECT pg_try_advisory_lock(847291)")
+                    if not acquired:
+                        logger.debug("Another engine replica holds the sweeper leader lock. Skipping sweep.")
+                        return
+                    try:
+                        await self._do_sweep()
+                    finally:
+                        await conn.execute("SELECT pg_advisory_unlock(847291)")
+            except Exception as e:
+                logger.error(f"Error acquiring/executing sweeper leader lock: {e}")
+        else:
+            await self._do_sweep()
+
+    async def _do_sweep(self):
+        """Internal sweep execution."""
         now = time.time()
         grace_period = settings.orphan_grace_period_sec
 
@@ -74,7 +97,8 @@ class Sweeper:
             logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
             try:
                 if lease.sandbox_id and lease.sandbox_id != "pending":
-                    remove_ws = settings.driver == "docker" and bool(lease.workspace_id)
+                    # Resolves M8: configurable workspace retention instead of deleting on every lease expiry
+                    remove_ws = settings.docker_remove_workspace_on_expiry and bool(lease.workspace_id)
                     await self.driver.destroy_sandbox(lease.sandbox_id, remove_workspace=remove_ws)
                 SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
             except Exception as e:
@@ -174,7 +198,10 @@ class Sweeper:
                     f"{l.tenant_id or 'default'}:{l.workspace_id}" for l in active_leases if l.workspace_id
                 }
                 if hasattr(self.driver, "cleanup_orphaned_pvcs"):
-                    await self.driver.cleanup_orphaned_pvcs(active_workspace_keys)
+                    await self.driver.cleanup_orphaned_pvcs(
+                        active_workspace_keys,
+                        max_age_seconds=settings.workspace_retention_seconds,
+                    )
             except Exception as e:
                 logger.error(f"Failed to run PVC garbage collection: {e}")
 

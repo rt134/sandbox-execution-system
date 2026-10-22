@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
@@ -62,7 +63,9 @@ func PTYHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() {
 		_ = ptmx.Close()
-		if cmd.Process != nil {
+		if cmd.Process != nil && cmd.Process.Pid > 0 {
+			// Resolves L9: kill entire process group to ensure background child processes terminate
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}

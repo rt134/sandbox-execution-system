@@ -22,6 +22,12 @@ data:
     acl cgnat dst 100.64.0.0/10
     acl alibaba_meta dst 100.100.100.200/32
     acl azure_wire dst 168.63.129.16/32
+    # IPv6 Loopback, Private, Link-Local, and Cloud Metadata
+    acl loopback_v6 dst ::1/128
+    acl rfc4193_ula dst fc00::/7
+    acl rfc4291_linklocal dst fe80::/10
+    acl cloud_meta_v6 dst fd00:ec2::254/128
+
     http_access deny cloud_metadata
     http_access deny loopback_net
     http_access deny rfc1918_class_a
@@ -30,9 +36,16 @@ data:
     http_access deny cgnat
     http_access deny alibaba_meta
     http_access deny azure_wire
+    http_access deny loopback_v6
+    http_access deny rfc4193_ula
+    http_access deny rfc4291_linklocal
+    http_access deny cloud_meta_v6
 
-    acl allowed_domains dstdomain .pypi.org .pythonhosted.org .npmjs.org .npmjs.com .registry.npmjs.org .github.com .huggingface.co
-    http_access allow allowed_domains
+    # Restrict allowed package registries (PyPI and npm). GitHub & HuggingFace dropped to block exfiltration
+    acl read_methods method GET HEAD
+    acl package_domains dstdomain .pypi.org .pythonhosted.org .npmjs.org .npmjs.com .registry.npmjs.org
+    http_access allow CONNECT SSL_ports package_domains
+    http_access allow read_methods package_domains
     http_access deny all
     cache deny all
 ---

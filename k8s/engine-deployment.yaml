@@ -14,6 +14,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: sandbox-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       terminationGracePeriodSeconds: 60
       serviceAccountName: sandbox-engine-sa
@@ -47,6 +51,8 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 9090
+              name: metrics
           env:
             - name: POD_NAME
               valueFrom:
@@ -60,6 +66,8 @@ spec:
               value: "production"
             - name: SANDBOX_DRIVER
               value: "k8s"
+            - name: SANDBOX_IMAGE
+              value: "sandbox-base@sha256:d6b63ff5a9d82e2c562bf57b4912fa9aa4e17efcbba596fdfefcfaeb1f6ce6a2"
             - name: SANDBOX_K8S_NAMESPACE
               value: "sandboxes"
             - name: SANDBOX_K8S_USE_PVC
@@ -73,6 +81,11 @@ spec:
                 secretKeyRef:
                   name: sandbox-secrets
                   key: api-key
+            - name: SANDBOX_TENANT_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-secrets
+                  key: tenant-keys
             - name: SANDBOX_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
@@ -86,6 +99,13 @@ spec:
           volumeMounts:
             - name: tmp-dir
               mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /livez
@@ -124,5 +144,10 @@ spec:
     app.kubernetes.io/name: sandbox-engine
   ports:
     - protocol: TCP
+      name: http
       port: 8080
       targetPort: 8080
+    - protocol: TCP
+      name: metrics
+      port: 9090
+      targetPort: 9090

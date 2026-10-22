@@ -27,6 +27,7 @@ class WarmPoolManager:
         self.engine_id = engine_id or settings.engine_instance_id
         self.queue: asyncio.Queue[SandboxInstance] = asyncio.Queue()
         self._active_spawns: int = 0
+        self._active_on_demand: int = 0
         self._running: bool = False
         self._all_pool_ids: Set[str] = set()
         self._background_tasks: Set[asyncio.Task] = set()
@@ -60,11 +61,25 @@ class WarmPoolManager:
             self.trigger_replenish()
             return instance
         except asyncio.TimeoutError:
-            logger.warning("Warm pool queue empty! Spawning on-demand sandbox...")
             WARM_POOL_ACQUISITIONS_TOTAL.labels(result="miss").inc()
-            instance = await self._create_one_instance()
-            self.trigger_replenish()
-            return instance
+            if self._active_on_demand >= settings.max_on_demand_spawns:
+                logger.warning(
+                    f"Warm pool empty and on-demand spawn limit reached ({self._active_on_demand}/{settings.max_on_demand_spawns})"
+                )
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=503,
+                    detail="Warm pool exhausted and on-demand capacity limit reached. Retry shortly.",
+                    headers={"Retry-After": "2"},
+                )
+            logger.warning("Warm pool queue empty! Spawning on-demand sandbox...")
+            self._active_on_demand += 1
+            try:
+                instance = await self._create_one_instance()
+                self.trigger_replenish()
+                return instance
+            finally:
+                self._active_on_demand = max(0, self._active_on_demand - 1)
 
     def trigger_replenish(self):
         """Fire-and-forget task to restore pool size."""

@@ -42,3 +42,22 @@ SWEEPER_RECLAIMS_TOTAL = Counter(
     "Total number of expired leases or orphan sandboxes reclaimed by sweeper",
     ["reason"],  # "expired_lease", "orphan_container"
 )
+
+# 5. Operational & Reliability Metrics
+RATE_LIMITER_FALLBACK_TOTAL = Counter(
+    "sandbox_ratelimiter_fallback_total",
+    "Number of times rate limiter fell back to in-memory window due to backend errors",
+)
+
+POD_CREATE_FAILURES_TOTAL = Counter(
+    "sandbox_pod_create_failures_total",
+    "Total number of container/pod creation failures",
+    ["driver", "sandbox_type"],
+)
+
+POD_CREATE_DURATION_SECONDS = Histogram(
+    "sandbox_pod_create_duration_seconds",
+    "Time taken to create and wait for pod readiness in seconds",
+    ["driver"],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0],
+)

@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import logging
 import re
+import socket
 import time
-from typing import Dict, List, Optional
+import uuid
+from typing import Dict, List, Optional, Set
 import httpx
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client.exceptions import ApiException
@@ -55,8 +57,10 @@ class KubernetesDriver(ContainerDriver):
         now = time.time()
 
         # Sanitize Pod name to be RFC 1123 compliant (lowercase alphanumeric & hyphens only)
-        clean_id = re.sub(r"[^a-z0-9\-]", "-", spec.spec_id.lower()).strip("-")[:40]
-        pod_name = f"sandbox-{clean_id}"
+        # Resolves M9: Append random entropy to prevent pod name collision with terminating pods or fast session reuse
+        clean_id = re.sub(r"[^a-z0-9\-]", "-", spec.spec_id.lower()).strip("-")[:32]
+        rand_suffix = uuid.uuid4().hex[:6]
+        pod_name = f"sandbox-{clean_id}-{rand_suffix}"
 
         labels = {
             "sandbox.managed": "true",
@@ -74,6 +78,25 @@ class KubernetesDriver(ContainerDriver):
             )
         ]
         node_selector = {settings.k8s_node_selector_key: settings.k8s_node_selector_value}
+
+        # Resolves H2: Sandboxes have no direct DNS egress to prevent DNS tunneling exfiltration.
+        # Inject host_aliases for Squid proxy hostname so sandboxes resolve the proxy via /etc/hosts
+        host_aliases = []
+        if settings.http_proxy:
+            match = re.search(r"https?://([^:/]+)", settings.http_proxy)
+            if match:
+                proxy_host = match.group(1)
+                if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", proxy_host):
+                    try:
+                        resolved_ip = socket.gethostbyname(proxy_host)
+                        host_aliases.append(
+                            client.V1HostAlias(
+                                ip=resolved_ip,
+                                hostnames=[proxy_host],
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning("Could not resolve proxy host '%s' for host_aliases: %s", proxy_host, e)
 
         # Container environment
         container_env = [
@@ -142,10 +165,13 @@ class KubernetesDriver(ContainerDriver):
             seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
         )
 
+        # Resolves H1: Pin by digest uses IfNotPresent; mutable tags (:latest) pull Always to avoid stale-cache risks
+        pull_policy = "IfNotPresent" if ("@" in spec.image or not spec.image.endswith(":latest")) else "Always"
+
         container = client.V1Container(
             name="sandbox-kernel",
             image=spec.image,
-            image_pull_policy="IfNotPresent",
+            image_pull_policy=pull_policy,
             ports=[client.V1ContainerPort(container_port=5004)],
             env=container_env,
             volume_mounts=volume_mounts if volume_mounts else None,
@@ -176,6 +202,8 @@ class KubernetesDriver(ContainerDriver):
             restart_policy="Never",
             termination_grace_period_seconds=5,
         )
+        if host_aliases:
+            pod_spec_kwargs["host_aliases"] = host_aliases
         if spec.sandbox_type == "stateful":
             pod_spec_kwargs["active_deadline_seconds"] = settings.max_session_lifetime
         pod_spec = client.V1PodSpec(**pod_spec_kwargs)
@@ -360,14 +388,17 @@ class KubernetesDriver(ContainerDriver):
                 return False
             raise
 
-    async def cleanup_orphaned_pvcs(self, active_workspace_keys: set[str], max_age_seconds: float = 86400.0) -> int:
+    async def cleanup_orphaned_pvcs(self, active_workspace_keys: Set[str], max_age_seconds: Optional[float] = None) -> int:
         """
         Garbage collect PVCs that are not associated with any active workspace
         and not mounted by any running pod, preventing ResourceQuota exhaustion (150 PVC cap).
+        Resolves M8: Uses UID and resourceVersion preconditions to prevent deleting newly re-acquired workspaces.
         """
         await self._init_client()
         namespace = settings.k8s_namespace
         deleted_count = 0
+        if max_age_seconds is None:
+            max_age_seconds = settings.workspace_retention_seconds
         try:
             pvcs = await self._core_api.list_namespaced_persistent_volume_claim(
                 namespace=namespace,
@@ -405,6 +436,12 @@ class KubernetesDriver(ContainerDriver):
                         await self._core_api.delete_namespaced_persistent_volume_claim(
                             name=pvc_name,
                             namespace=namespace,
+                            body=client.V1DeleteOptions(
+                                preconditions=client.V1Preconditions(
+                                    uid=pvc.metadata.uid,
+                                    resource_version=pvc.metadata.resource_version,
+                                )
+                            ),
                         )
                         deleted_count += 1
                     except ApiException as e:

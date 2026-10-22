@@ -1,5 +1,18 @@
 package handlers
 
+// Security Architecture Note (M5 & L10):
+// The filesystem operations in this handler (/fs/write, /fs/read, /fs/list, /fs/delete)
+// and their path sanitation/symlink checks serve as UX convenience and early sanity checks.
+// They are NOT the primary security boundary, because code executed via /exec or /execute
+// runs directly inside the container with full shell access.
+//
+// The true isolation and boundary enforcement is provided at the infrastructure level:
+// 1. gVisor (runsc) / Kata RuntimeClass for kernel syscall isolation.
+// 2. Kubernetes NetworkPolicy for network egress restriction and DNS isolation.
+// 3. Kubernetes volume limits (emptyDir.sizeLimit, ephemeral-storage limits, PVC quotas)
+//    which enforce hard disk bounds regardless of whether writes occur via API or shell execution.
+// 4. Kubelet podPidsLimit on sandbox node pools (M6) to prevent PID exhaustion/fork bombs.
+
 import (
 	"encoding/base64"
 	"encoding/json"

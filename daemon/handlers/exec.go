@@ -178,8 +178,20 @@ func handleStreamingExec(w http.ResponseWriter, cmd *exec.Cmd, ctx context.Conte
 		streamOutput(stderrPipe, "stderr")
 	}()
 
+	// Unblock pipe readers if execution times out or context is cancelled
+	pipeCloseDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
+		case <-pipeCloseDone:
+		}
+	}()
+
 	// Wait for pipe readers to complete BEFORE calling cmd.Wait() to prevent races
 	wg.Wait()
+	close(pipeCloseDone)
 	execErr := cmd.Wait()
 
 	exitCode := 0

@@ -9,16 +9,16 @@ description = "High-performance execution engine and container pool manager"
 authors = [{ name = "Sandbox Engineering Team" }]
 requires-python = ">=3.9"
 dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn[standard]>=0.23.0",
-    "httpx>=0.24.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "docker>=7.0.0",
-    "kubernetes-asyncio>=33.0.0",
-    "asyncpg>=0.29.0",
-    "cryptography>=42.0.0",
-    "prometheus-client>=0.19.0",
+    "fastapi>=0.100.0,<0.116.0",
+    "uvicorn[standard]>=0.23.0,<0.33.0",
+    "httpx>=0.24.0,<0.29.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "pydantic-settings>=2.0.0,<3.0.0",
+    "docker>=7.0.0,<8.0.0",
+    "kubernetes-asyncio>=33.0.0,<34.0.0",
+    "asyncpg>=0.29.0,<0.31.0",
+    "cryptography>=42.0.0,<44.0.0",
+    "prometheus-client>=0.19.0,<1.0.0",
 ]
 
 [project.optional-dependencies]

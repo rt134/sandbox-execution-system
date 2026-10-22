@@ -9,9 +9,9 @@ description = "Lightweight async Python client library for Sandbox Execution Sys
 authors = [{ name = "Sandbox Engineering Team" }]
 requires-python = ">=3.9"
 dependencies = [
-    "httpx>=0.24.0",
-    "websockets>=11.0",
-    "pydantic>=2.0.0",
+    "httpx>=0.24.0,<0.29.0",
+    "websockets>=11.0,<15.0",
+    "pydantic>=2.0.0,<3.0.0",
 ]
 
 [project.optional-dependencies]

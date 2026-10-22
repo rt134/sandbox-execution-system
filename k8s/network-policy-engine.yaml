@@ -8,8 +8,46 @@ spec:
     matchLabels:
       app.kubernetes.io/name: sandbox-engine
   policyTypes:
+    - Ingress
     - Egress
+  ingress:
+    # 1. API traffic on port 8080
+    - ports:
+        - protocol: TCP
+          port: 8080
+    # 2. Prometheus metrics scrape on port 9090 restricted to monitoring/system namespaces
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: ["monitoring", "prometheus", "sandbox-system"]
+      ports:
+        - protocol: TCP
+          port: 9090
   egress:
+    # 1. DNS Resolution (CoreDNS / Kube-DNS in kube-system)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: ["kube-dns", "coredns"]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. Kubernetes API Server (for managing sandbox pods, PVCs, and runtime classes)
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    # 3. Communication to Sandbox Daemons inside the sandboxes namespace
     - to:
         - namespaceSelector:
             matchLabels:
@@ -17,6 +55,7 @@ spec:
       ports:
         - protocol: TCP
           port: 5004
+    # 4. Outbound Proxy (Squid)
     - to:
         - podSelector:
             matchLabels:
@@ -24,14 +63,21 @@ spec:
       ports:
         - protocol: TCP
           port: 3128
+    # 5. Database (PostgreSQL) and Cache (Redis)
     - to:
         - namespaceSelector: {}
           podSelector:
             matchLabels:
               app: postgres
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
       ports:
         - protocol: TCP
           port: 5432
+        - protocol: TCP
+          port: 6379
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -45,6 +91,22 @@ spec:
   policyTypes:
     - Egress
   egress:
+    # 1. DNS resolution for Squid forward proxy
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchExpressions:
+              - key: k8s-app
+                operator: In
+                values: ["kube-dns", "coredns"]
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. External HTTP/HTTPS egress for allowed domains
     - ports:
         - protocol: TCP
           port: 80

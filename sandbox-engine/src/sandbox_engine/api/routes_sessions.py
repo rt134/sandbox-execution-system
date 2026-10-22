@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -32,6 +33,19 @@ router = APIRouter(
     tags=["Stateful Sessions"],
     dependencies=[Depends(verify_api_key)],
 )
+
+
+async def _parse_json_body(request: Request) -> dict:
+    """Safely parse request body as JSON, returning HTTP 400 on malformed payloads (L6)."""
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body: expected JSON object")
+        return body
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in request payload")
 
 
 def get_driver(request: Request) -> ContainerDriver:
@@ -317,7 +331,7 @@ async def proxy_exec(
     validate_session_id(session_id)
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
-    body = await request.json()
+    body = await _parse_json_body(request)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
     # Audit log the command invocation
@@ -355,6 +369,13 @@ async def proxy_exec(
                     async for chunk in r.aiter_bytes():
                         total_bytes += len(chunk)
                         if total_bytes > settings.max_stream_response_bytes:
+                            # Resolves L6: Emit explicit error chunk before terminating stream
+                            trunc_err = json.dumps({
+                                "stream": "stderr",
+                                "error": f"Stream truncated: exceeded {settings.max_stream_response_bytes} bytes limit",
+                                "exit_code": 1,
+                            }) + "\n"
+                            yield trunc_err.encode("utf-8")
                             break
                         yield chunk
             finally:
@@ -408,7 +429,7 @@ async def proxy_fs_write(
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    body = await request.json()
+    body = await _parse_json_body(request)
 
     # Audit log file write
     await lease_mgr.log_audit_event(
@@ -470,7 +491,7 @@ async def proxy_fs_delete(
     tenant_id = getattr(request.state, "tenant_id", "default")
     endpoint, auth_token = await _get_active_session(session_id, lease_mgr, tenant_id=tenant_id)
     headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
-    body = await request.json()
+    body = await _parse_json_body(request)
 
     # Audit log file delete
     await lease_mgr.log_audit_event(

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import OrderedDict
 from typing import Dict, List, Optional
 from fastapi import HTTPException, status
 from ..config import settings
+from .metrics import RATE_LIMITER_FALLBACK_TOTAL
+
+logger = logging.getLogger("sandbox.rate_limiter")
 
 
 class RateLimiter:
@@ -75,9 +79,10 @@ class RateLimiter:
                 return
             except HTTPException:
                 raise
-            except Exception:
-                # Fall back to PostgreSQL or local memory if Redis call fails
-                pass
+            except Exception as e:
+                # Resolves L2: log warning and emit metric when backend fails over to memory
+                logger.warning(f"Rate limiter Redis backend failed for tenant '{tenant_id}': {e}. Falling back.")
+                RATE_LIMITER_FALLBACK_TOTAL.inc()
 
         # 2. Distributed PostgreSQL Implementation (multi-replica synchronized)
         if self.pool:
@@ -105,8 +110,10 @@ class RateLimiter:
                     return
             except HTTPException:
                 raise
-            except Exception:
-                pass
+            except Exception as e:
+                # Resolves L2: log warning and emit metric when backend fails over to memory
+                logger.warning(f"Rate limiter PostgreSQL backend failed for tenant '{tenant_id}': {e}. Falling back.")
+                RATE_LIMITER_FALLBACK_TOTAL.inc()
 
         # 3. Local Bounded Sliding Window Implementation (fallback)
         now = time.time()
