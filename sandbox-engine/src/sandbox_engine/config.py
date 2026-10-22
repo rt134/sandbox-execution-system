@@ -42,7 +42,7 @@ class EngineSettings(BaseSettings):
     max_session_lifetime: int = 7200  # Absolute cap from session created_at
     max_stateless_timeout: float = 60.0  # Max 60 seconds execution timeout
     max_concurrent_sessions_per_tenant: int = 10  # Max active sessions per tenant
-    max_stateless_per_tenant: int = 10  # Max concurrent stateless runs per tenant
+    max_stateless_per_tenant: int = 3  # Max concurrent stateless runs per tenant (replica capacity is 2 pool + 4 on-demand = 6; tenant cap 3 prevents starving other tenants)
     max_workspaces_per_tenant: int = 20  # Distinct workspace_ids per tenant (PVC cap guard)
     rate_limit_requests_per_minute: int = 120  # Rate limit per tenant
 
@@ -142,25 +142,26 @@ class EngineSettings(BaseSettings):
                     "Production requires either SANDBOX_TENANT_KEYS_JSON or SANDBOX_API_KEY to be set! "
                     "Refusing to start engine in fail-open unauthenticated mode."
                 )
+            weak_patterns = [
+                "change-in-prod",
+                "replace-me",
+                "replace-in-prod",
+                "default-secret",
+                "secret-key",
+                "sandbox-default",
+                "default-sandbox",
+                "sandbox-secret",
+                "12345",
+                "password",
+                "admin",
+            ]
+
             # 1. API Key Validation (if configured)
             if self.api_key:
                 if len(self.api_key) < 32:
                     raise ValueError(
                         f"Production SANDBOX_API_KEY is too short ({len(self.api_key)} chars). Must be at least 32 characters."
                     )
-                weak_patterns = [
-                    "change-in-prod",
-                    "replace-me",
-                    "replace-in-prod",
-                    "default-secret",
-                    "secret-key",
-                    "sandbox-default",
-                    "default-sandbox",
-                    "sandbox-secret",
-                    "12345",
-                    "password",
-                    "admin",
-                ]
                 for wp in weak_patterns:
                     if wp in self.api_key.lower():
                         raise ValueError(
@@ -176,7 +177,7 @@ class EngineSettings(BaseSettings):
                     UserWarning,
                 )
 
-            # 2. Encryption Key Validation
+            # 3. Encryption Key Validation
             if not self.encryption_key or len(self.encryption_key) < 32:
                 raise ValueError(
                     "Production requires a strong SANDBOX_ENCRYPTION_KEY of at least 32 characters for token encryption at rest."

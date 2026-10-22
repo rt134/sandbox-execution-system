@@ -221,12 +221,7 @@ async def authenticate_tenant_credentials(
             )
         tenant_id = matched_tenant
     else:
-        if is_prod:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Server configuration error: SANDBOX_TENANT_KEYS_JSON required in production",
-            )
-        tenant_id = tenant_str if tenant_str else "default"
+        # Resolves N2: Support api-key-only authentication when SANDBOX_TENANT_KEYS_JSON is not configured
         if expected_key:
             if not provided_key or not safe_compare_digest(provided_key, expected_key):
                 raise HTTPException(
@@ -234,6 +229,14 @@ async def authenticate_tenant_credentials(
                     detail="Unauthorized: invalid or missing Sandbox API key",
                     headers={"WWW-Authenticate": "Bearer"},
                 )
+            tenant_id = tenant_str if tenant_str else "default"
+        else:
+            if is_prod:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Server configuration error: SANDBOX_API_KEY or SANDBOX_TENANT_KEYS_JSON required in production",
+                )
+            tenant_id = tenant_str if tenant_str else "default"
 
     if not TENANT_ID_REGEX.fullmatch(tenant_id):
         raise HTTPException(
