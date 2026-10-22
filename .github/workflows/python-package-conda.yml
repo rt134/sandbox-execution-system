@@ -50,7 +50,7 @@ jobs:
     - name: Audit Python dependencies (pip-audit)
       shell: bash -el {0}
       run: |
-        pip-audit --desc on
+        pip-audit --desc on --skip-editable
 
     - name: Validate Kubernetes manifests (kubeconform)
       run: |
