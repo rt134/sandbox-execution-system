@@ -126,7 +126,7 @@ async def admission_and_size_limits(request: Request, call_next):
     range_hdr = request.headers.get("range")
     if range_hdr and (len(range_hdr) > 512 or range_hdr.count(",") > 10):
         return JSONResponse(
-            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            status_code=status.HTTP_416_RANGE_NOT_SATISFIABLE,
             content={"detail": "Range header too complex or exceeds allowed ranges"},
             headers={"X-Request-ID": request_id},
         )

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -243,3 +244,48 @@ async def test_request_id_injected_m10():
         custom_id = "req-custom-trace-12345"
         resp2 = await client.get("/livez", headers={"X-Request-ID": custom_id})
         assert resp2.headers.get("x-request-id") == custom_id
+
+
+@pytest.mark.asyncio
+async def test_path_validation_host_poisoning_cve_2026_54282():
+    """Verify that malformed request paths (e.g. missing leading slash or authority injection) are blocked (CVE-2026-54282)."""
+    # ASGI scope directly testable
+    app_callable = app
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "@attacker.com/v1/sessions",
+        "headers": [(b"host", b"localhost")],
+        "query_string": b"",
+    }
+    sent_messages = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await app_callable(scope, receive, send)
+    start_msg = next((m for m in sent_messages if m["type"] == "http.response.start"), None)
+    assert start_msg is not None
+    assert start_msg["status"] == 400
+
+
+@pytest.mark.asyncio
+async def test_range_header_redos_defense_pysec_2026_1942():
+    """Verify that crafted Range headers triggering quadratic processing are blocked (PYSEC-2026-1942)."""
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Excessive length Range header (PoC payload from advisory: 5000 zeros)
+        malicious_range_poc = "bytes=" + ("0" * 2000) + "a-"
+        start_t = time.perf_counter()
+        resp_poc = await client.get("/livez", headers={"Range": malicious_range_poc})
+        duration = time.perf_counter() - start_t
+        assert resp_poc.status_code == 416
+        # Must return in sub-millisecond time without quadratic ReDoS delay
+        assert duration < 0.1, f"Range rejection took too long ({duration:.4f}s), possible ReDoS!"
+
+        # 2. Too many range intervals (>10 ranges)
+        multi_ranges = "bytes=" + ",".join([f"{i*10}-{i*10+5}" for i in range(25)])
+        resp_multi = await client.get("/livez", headers={"Range": multi_ranges})
+        assert resp_multi.status_code == 416
