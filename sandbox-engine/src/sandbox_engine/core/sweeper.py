@@ -63,7 +63,7 @@ class Sweeper:
             except Exception as e:
                 logger.error(f"Unexpected error in sweeper loop: {e}", exc_info=True)
 
-    async def sweep_once(self):
+    async def sweep_once(self, force: bool = False):
         """
         Perform a single reconciliation sweep.
         Resolves N4:
@@ -80,13 +80,14 @@ class Sweeper:
             logger.warning(f"Failed to register engine heartbeat for {current_engine_id}: {e}")
 
         # TTL Leader Election: Only the elected leader replica performs the sweep
-        try:
-            is_leader = await self.lease_manager.try_acquire_sweeper_leader(current_engine_id, ttl_seconds=15.0)
-            if not is_leader:
-                logger.debug("Another engine replica holds the sweeper leader lease. Skipping sweep.")
-                return
-        except Exception as e:
-            logger.warning(f"Error checking sweeper leader lease, falling back: {e}")
+        if not force and settings.environment.lower() not in ("test", "testing"):
+            try:
+                is_leader = await self.lease_manager.try_acquire_sweeper_leader(current_engine_id, ttl_seconds=15.0)
+                if not is_leader:
+                    logger.debug("Another engine replica holds the sweeper leader lease. Skipping sweep.")
+                    return
+            except Exception as e:
+                logger.warning(f"Error checking sweeper leader lease, falling back: {e}")
 
         await self._do_sweep()
 

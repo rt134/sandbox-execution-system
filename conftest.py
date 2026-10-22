@@ -70,10 +70,14 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
-def isolated_sqlite_ledger(tmp_path, monkeypatch):
+def isolated_sqlite_ledger(request, tmp_path, monkeypatch):
+    if "postgres" in request.node.name or "test_postgres" in request.node.fspath.basename:
+        return
     db_path = tmp_path / "sandbox_ledger.db"
     monkeypatch.setenv("SANDBOX_SQLITE_PATH", str(db_path))
     monkeypatch.setattr(settings, "sqlite_path", str(db_path), raising=False)
+    monkeypatch.setenv("SANDBOX_POSTGRES_URL", "")
+    monkeypatch.setattr(settings, "postgres_url", None, raising=False)
 
 
 @pytest.fixture(autouse=True)
