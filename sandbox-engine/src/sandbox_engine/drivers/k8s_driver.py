@@ -223,11 +223,10 @@ class KubernetesDriver(ContainerDriver):
         )
 
         runtime_class = settings.k8s_runtime_class
-        if runtime_class and runtime_class.lower() in ("none", "runc", ""):
+        if not runtime_class or runtime_class.strip().lower() in ("none", "runc", ""):
             runtime_class = None
 
         pod_spec_kwargs = dict(
-            runtime_class_name=runtime_class,
             tolerations=tolerations,
             node_selector=node_selector,
             automount_service_account_token=False,
@@ -243,6 +242,8 @@ class KubernetesDriver(ContainerDriver):
             restart_policy="Never",
             termination_grace_period_seconds=5,
         )
+        if runtime_class:
+            pod_spec_kwargs["runtime_class_name"] = runtime_class
         if host_aliases:
             pod_spec_kwargs["host_aliases"] = host_aliases
         if spec.sandbox_type == "stateful":
