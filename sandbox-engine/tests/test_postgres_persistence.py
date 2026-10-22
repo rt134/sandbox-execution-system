@@ -241,29 +241,34 @@ def test_workspace_id_newline_rejected():
     assert "Invalid workspace_id" in exc_info.value.detail
 
 
-def test_production_mode_refuses_to_start_without_tenant_keys(monkeypatch):
-    """Verify that production mode refuses to start without SANDBOX_TENANT_KEYS_JSON."""
+def test_production_mode_refuses_to_start_without_auth(monkeypatch):
+    """Verify that production mode refuses to start without any auth configured."""
     monkeypatch.setattr(settings, "environment", "production")
     monkeypatch.setattr(settings, "tenant_keys_json", None)
-    monkeypatch.setattr(settings, "api_key", "a" * 32)
+    monkeypatch.setattr(settings, "api_key", None)
     monkeypatch.setattr(settings, "encryption_key", "b" * 32)
     monkeypatch.setattr(settings, "postgres_url", "postgresql://user:pass@host:5432/db")
     monkeypatch.setattr(settings, "driver", "k8s")
 
-    with pytest.raises(ValueError, match="SANDBOX_TENANT_KEYS_JSON"):
+    with pytest.raises(ValueError, match="Production requires either SANDBOX_TENANT_KEYS_JSON or SANDBOX_API_KEY"):
         settings.validate_production_settings()
 
 
-def test_production_mode_refuses_to_start_without_api_key(monkeypatch):
-    """Verify that production mode refuses to start without SANDBOX_API_KEY when tenant keys exist."""
-    tenant_keys = '{"prodtenant": "' + ("c" * 32) + '"}'
+def test_production_mode_accepts_either_tenant_keys_or_api_key(monkeypatch):
+    """Verify that production mode accepts either SANDBOX_TENANT_KEYS_JSON or SANDBOX_API_KEY alone."""
     monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "tenant_keys_json", tenant_keys)
-    monkeypatch.setattr(settings, "api_key", None)
     monkeypatch.setattr(settings, "encryption_key", "d" * 32)
     monkeypatch.setattr(settings, "postgres_url", "postgresql://user:pass@host:5432/db")
     monkeypatch.setattr(settings, "driver", "k8s")
 
-    with pytest.raises(ValueError, match="Production environment requires SANDBOX_API_KEY"):
-        settings.validate_production_settings()
+    # 1. API key only
+    monkeypatch.setattr(settings, "tenant_keys_json", None)
+    monkeypatch.setattr(settings, "api_key", "a" * 32)
+    settings.validate_production_settings()
+
+    # 2. Tenant keys only
+    monkeypatch.setattr(settings, "api_key", None)
+    monkeypatch.setattr(settings, "tenant_keys_json", '{"prodtenant": "' + ("c" * 32) + '"}')
+    settings.validate_production_settings()
+
 
