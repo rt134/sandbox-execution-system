@@ -130,7 +130,8 @@ def test_filesystem():
     log_test("GET /fs/list", found, f"(found {len(items)} items)")
 
     # 3. Read file
-    with urllib.request.urlopen(f"{BASE_URL}/fs/read?path=test_dir/hello.py") as resp:
+    req = urllib.request.Request(f"{BASE_URL}/fs/read?path=test_dir/hello.py", headers=_auth_headers())
+    with urllib.request.urlopen(req) as resp:
         content = resp.read().decode("utf-8")
         log_test("GET /fs/read", "Hello {name}" in content)
 
@@ -158,8 +159,15 @@ import websockets
 async def async_test_pty():
     ws_base = BASE_URL.replace("http://", "ws://").replace("https://", "wss://")
     uri = f"{ws_base}/ws/pty"
-    extra_headers = [("Authorization", f"Bearer {AUTH_TOKEN}")] if AUTH_TOKEN else []
-    async with websockets.connect(uri, extra_headers=extra_headers) as ws:
+    ws_kwargs = {}
+    if AUTH_TOKEN:
+        import inspect
+        params = inspect.signature(websockets.connect).parameters
+        if "additional_headers" in params:
+            ws_kwargs["additional_headers"] = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+        else:
+            ws_kwargs["extra_headers"] = [("Authorization", f"Bearer {AUTH_TOKEN}")]
+    async with websockets.connect(uri, **ws_kwargs) as ws:
         # 1. Send window resize event
         resize_msg = json.dumps({"type": "resize", "cols": 100, "rows": 30})
         await ws.send(resize_msg)
