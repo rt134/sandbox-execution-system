@@ -113,6 +113,24 @@ async def admission_and_size_limits(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
     request.state.request_id = request_id
 
+    # Defense-in-Depth: Path validation & Host header poisoning guard (CVE-2026-54282)
+    raw_path = request.scope.get("path", "")
+    if not raw_path.startswith("/") or "@" in raw_path.split("?")[0].split("/")[0]:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": "Bad Request: Malformed request path"},
+            headers={"X-Request-ID": request_id},
+        )
+
+    # Defense-in-Depth: Range header ReDoS / CPU exhaustion guard (PYSEC-2026-1942)
+    range_hdr = request.headers.get("range")
+    if range_hdr and (len(range_hdr) > 512 or range_hdr.count(",") > 10):
+        return JSONResponse(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            content={"detail": "Range header too complex or exceeds allowed ranges"},
+            headers={"X-Request-ID": request_id},
+        )
+
     if request.url.path.startswith("/v1/"):
         # Resolves M2: Non-raising admission check returns 503 JSONResponse directly
         if not await try_acquire_in_flight():
