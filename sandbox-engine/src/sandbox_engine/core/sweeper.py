@@ -97,52 +97,72 @@ class Sweeper:
         grace_period = settings.orphan_grace_period_sec
 
         # 1. Clean up expired leases (atomic claim to avoid killing containers that just renewed)
-        expired_leases = await self.lease_manager.claim_expired(cutoff_time=now)
-        for lease in expired_leases:
-            logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
-            try:
-                if lease.sandbox_id and lease.sandbox_id != "pending":
-                    # Resolves M8: configurable workspace retention instead of deleting on every lease expiry
-                    remove_ws = settings.docker_remove_workspace_on_expiry and bool(lease.workspace_id)
-                    await self.driver.destroy_sandbox(lease.sandbox_id, remove_workspace=remove_ws)
-                SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
-            except Exception as e:
-                logger.error(f"Failed to destroy sandbox {lease.sandbox_id}: {e}")
-            finally:
-                if lease.workspace_id:
-                    await self.lease_manager.release_workspace_lock(
-                        lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
-                    )
-                # Resolves N3 & M9: only transition to expired from 'reclaiming'
-                await self.lease_manager.mark_expired(lease.session_id, from_status="reclaiming")
+        try:
+            expired_leases = await self.lease_manager.claim_expired(cutoff_time=now)
+            for lease in expired_leases:
+                logger.info(f"🧹 [Sweeper] Lease expired for session '{lease.session_id}'. Reclaiming container '{lease.sandbox_id}'...")
+                try:
+                    if lease.sandbox_id and lease.sandbox_id != "pending":
+                        # Resolves M8: configurable workspace retention instead of deleting on every lease expiry
+                        remove_ws = settings.docker_remove_workspace_on_expiry and bool(lease.workspace_id)
+                        await self.driver.destroy_sandbox(lease.sandbox_id, remove_workspace=remove_ws)
+                    SWEEPER_RECLAIMS_TOTAL.labels(reason="expired_lease").inc()
+                except Exception as e:
+                    logger.error(f"Failed to destroy sandbox {lease.sandbox_id}: {e}")
+                finally:
+                    if lease.workspace_id:
+                        try:
+                            await self.lease_manager.release_workspace_lock(
+                                lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to release workspace lock for {lease.workspace_id}: {e}")
+                    try:
+                        # Resolves N3 & M9: only transition to expired from 'reclaiming'
+                        await self.lease_manager.mark_expired(lease.session_id, from_status="reclaiming")
+                    except Exception as e:
+                        logger.error(f"Failed to mark lease expired for {lease.session_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to claim or process expired leases: {e}", exc_info=True)
 
         # 2. Reconcile any orphaned workspace locks
-        await self.lease_manager.cleanup_expired_workspace_locks()
+        try:
+            await self.lease_manager.cleanup_expired_workspace_locks()
+        except Exception as e:
+            logger.error(f"Failed to cleanup expired workspace locks: {e}", exc_info=True)
 
         # 3. Dead Container Reconciliation: Check active leases whose container has crashed/exited
         # Critical: skip 'pending' leases that are currently in the process of pod creation!
-        active_leases = await self.lease_manager.list_active()
-        for lease in active_leases:
-            if lease.sandbox_id and lease.sandbox_id != "pending":
-                try:
-                    alive = await self.driver.is_alive(lease.sandbox_id)
-                    if not alive:
-                        logger.warning(f"🧹 [Sweeper] Detected dead/missing container '{lease.sandbox_id}' for active session '{lease.session_id}'. Reconciling...")
-                        # Resolves N3: explicitly expire from 'active' status so quota and ledger are freed
-                        marked = await self.lease_manager.mark_expired(lease.session_id, from_status="active")
-                        if marked:
-                            if lease.workspace_id:
-                                await self.lease_manager.release_workspace_lock(
-                                    lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
-                                )
-                            SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
-                except Exception as e:
-                    logger.error(f"Failed to check liveness of container {lease.sandbox_id}: {e}")
+        active_leases: Optional[list] = None
+        try:
+            active_leases = await self.lease_manager.list_active()
+            for lease in active_leases:
+                if lease.sandbox_id and lease.sandbox_id != "pending":
+                    try:
+                        alive = await self.driver.is_alive(lease.sandbox_id)
+                        if not alive:
+                            logger.warning(
+                                f"🧹 [Sweeper] Detected dead/missing container '{lease.sandbox_id}' for active session '{lease.session_id}'. Reconciling..."
+                            )
+                            # Resolves N3: explicitly expire from 'active' status so quota and ledger are freed
+                            marked = await self.lease_manager.mark_expired(lease.session_id, from_status="active")
+                            if marked:
+                                if lease.workspace_id:
+                                    try:
+                                        await self.lease_manager.release_workspace_lock(
+                                            lease.workspace_id, lease.session_id, tenant_id=lease.tenant_id or "default"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to release workspace lock for {lease.workspace_id}: {e}")
+                                SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_container_reconciled").inc()
+                    except Exception as e:
+                        logger.error(f"Failed to check liveness of container {lease.sandbox_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to list or reconcile active leases: {e}", exc_info=True)
 
         # 4. Dead Engine Warm Container Garbage Collection
-        current_engine_id = self.warm_pool.engine_id if self.warm_pool else settings.engine_instance_id
-
         try:
+            current_engine_id = self.warm_pool.engine_id if self.warm_pool else settings.engine_instance_id
             dead_engines = await self.lease_manager.get_dead_engines(max_idle_sec=60.0)
             for dead_id in dead_engines:
                 if dead_id != current_engine_id:
@@ -150,7 +170,9 @@ class Sweeper:
                         labels={"sandbox.pool": "warm", "sandbox.engine_id": dead_id}
                     )
                     for sbx in dead_warm:
-                        logger.warning(f"🧹 [Sweeper] Reaping warm container '{sbx.sandbox_id}' from dead engine replica '{dead_id}'...")
+                        logger.warning(
+                            f"🧹 [Sweeper] Reaping warm container '{sbx.sandbox_id}' from dead engine replica '{dead_id}'..."
+                        )
                         try:
                             await self.driver.destroy_sandbox(sbx.sandbox_id)
                             SWEEPER_RECLAIMS_TOTAL.labels(reason="dead_engine_warm_reaped").inc()
@@ -159,28 +181,34 @@ class Sweeper:
                     # Prune dead engine so it does not accumulate and cause repeated K8s list calls
                     await self.lease_manager.delete_dead_engine(dead_id)
         except Exception as e:
-            logger.error(f"Failed to check dead engines: {e}")
+            logger.error(f"Failed to check dead engines: {e}", exc_info=True)
 
         # 5. Orphan stateful container garbage collection
         try:
-            active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id and l.sandbox_id != "pending"}
+            if active_leases is None:
+                logger.warning("Skipping orphan stateful container GC: active leases could not be retrieved")
+            else:
+                active_sandbox_ids = {l.sandbox_id for l in active_leases if l.sandbox_id and l.sandbox_id != "pending"}
 
-            running_sandboxes = await self.driver.list_sandboxes(labels={"sandbox.type": "stateful"})
-            for sbx in running_sandboxes:
-                if sbx.sandbox_id not in active_sandbox_ids:
-                    # Prevent race condition: do not reap containers in their creation/handshake window
-                    age = now - sbx.created_at
-                    if age < grace_period:
-                        continue
+                running_sandboxes = await self.driver.list_sandboxes(labels={"sandbox.type": "stateful"})
+                for sbx in running_sandboxes:
+                    if sbx.sandbox_id not in active_sandbox_ids:
+                        # Prevent race condition: do not reap containers in their creation/handshake window
+                        age = now - sbx.created_at
+                        if age < grace_period:
+                            continue
 
-                    logger.warning(f"🧹 [Sweeper] Found orphan stateful container '{sbx.sandbox_id}' (age: {age:.1f}s). Destroying...")
-                    try:
-                        await self.driver.destroy_sandbox(sbx.sandbox_id)
-                        SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_container").inc()
-                    except Exception as e:
-                        logger.error(f"Failed to destroy orphan container {sbx.sandbox_id}: {e}")
+                        logger.warning(f"🧹 [Sweeper] Found orphan stateful container '{sbx.sandbox_id}' (age: {age:.1f}s). Destroying...")
+                        try:
+                            await self.driver.destroy_sandbox(sbx.sandbox_id)
+                            SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_container").inc()
+                        except Exception as e:
+                            logger.error(f"Failed to destroy orphan container {sbx.sandbox_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error checking orphan stateful sandboxes: {e}", exc_info=True)
 
-            # 6. Orphan warm pool container garbage collection (reclaimed if this engine replica crashed)
+        # 6. Orphan warm pool container garbage collection (reclaimed if this engine replica crashed)
+        try:
             if self.warm_pool is not None:
                 tracked_pool_ids = self.warm_pool.get_active_ids()
                 # Multi-replica safe: only inspect warm containers created by this replica's engine_id!
@@ -192,36 +220,41 @@ class Sweeper:
                         age = now - sbx.created_at
                         if age < grace_period:
                             continue
-                        logger.warning(f"🧹 [Sweeper] Found orphan warm container '{sbx.sandbox_id}' for engine '{self.warm_pool.engine_id}' (age: {age:.1f}s). Destroying...")
+                        logger.warning(
+                            f"🧹 [Sweeper] Found orphan warm container '{sbx.sandbox_id}' for engine '{self.warm_pool.engine_id}' (age: {age:.1f}s). Destroying..."
+                        )
                         try:
                             await self.driver.destroy_sandbox(sbx.sandbox_id)
                             SWEEPER_RECLAIMS_TOTAL.labels(reason="orphan_warm_container").inc()
                         except Exception as e:
                             logger.error(f"Failed to destroy orphan warm sandbox {sbx.sandbox_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error checking orphan warm pool containers: {e}", exc_info=True)
 
-            # 7. Kubernetes PVC Garbage Collection
-            try:
+        # 7. Kubernetes PVC Garbage Collection
+        try:
+            if active_leases is not None and hasattr(self.driver, "cleanup_orphaned_pvcs"):
                 active_workspace_keys = {
                     f"{l.tenant_id or 'default'}:{l.workspace_id}" for l in active_leases if l.workspace_id
                 }
-                if hasattr(self.driver, "cleanup_orphaned_pvcs"):
-                    await self.driver.cleanup_orphaned_pvcs(
-                        active_workspace_keys,
-                        max_age_seconds=settings.workspace_retention_seconds,
-                    )
-            except Exception as e:
-                logger.error(f"Failed to run PVC garbage collection: {e}")
+                await self.driver.cleanup_orphaned_pvcs(
+                    active_workspace_keys,
+                    max_age_seconds=settings.workspace_retention_seconds,
+                )
+        except Exception as e:
+            logger.error(f"Failed to run PVC garbage collection: {e}", exc_info=True)
 
-            # 8. Prune database records (expired leases, audit logs, stale engines)
-            try:
-                await self.lease_manager.prune_database_records()
-            except Exception as e:
-                logger.error(f"Failed to prune database records: {e}")
+        # 8. Prune database records (expired leases, audit logs, stale engines)
+        try:
+            await self.lease_manager.prune_database_records()
+        except Exception as e:
+            logger.error(f"Failed to prune database records: {e}", exc_info=True)
 
-            # Update Prometheus gauges
-            ACTIVE_SESSIONS.set(len(active_leases))
+        # Update Prometheus gauges
+        try:
+            if active_leases is not None:
+                ACTIVE_SESSIONS.set(len(active_leases))
             active_locks = await self.lease_manager.count_active_locks()
             WORKSPACE_LOCKS_ACTIVE.set(active_locks)
-
         except Exception as e:
-            logger.error(f"Error checking orphan sandboxes: {e}")
+            logger.error(f"Failed to update sweeper gauge metrics: {e}", exc_info=True)

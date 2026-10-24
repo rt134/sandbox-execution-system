@@ -48,6 +48,7 @@ All environment variables use the `SANDBOX_` prefix.
 | **Kubernetes Driver Settings** | | | |
 | `SANDBOX_K8S_NAMESPACE` | `string` | `"sandboxes"` | Kubernetes namespace where sandbox Pods are launched. |
 | `SANDBOX_K8S_RUNTIME_CLASS` | `string` | `"gvisor"` | Kubernetes `RuntimeClass` name for gVisor isolation. |
+| `SANDBOX_ALLOW_INSECURE_K8S_RUNTIME` | `boolean` | `false` | When `true`, allows running insecure/runc runtime class in production with k8s driver. |
 | `SANDBOX_K8S_NODE_SELECTOR_KEY` | `string` | `"sandbox"` | Node selector label key for dedicated worker node pools. |
 | `SANDBOX_K8S_NODE_SELECTOR_VALUE` | `string` | `"true"` | Node selector label value for dedicated worker node pools. |
 | `SANDBOX_K8S_USE_PVC` | `boolean` | `false` | When `true`, mounts dynamic PVCs to `/workspace` instead of host paths. |

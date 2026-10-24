@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..config import settings
 from ..models import LeaseRecord
+from .metrics import LEASE_QUARANTINE_TOTAL
 from .security import decrypt_token, encrypt_token
 
 logger = logging.getLogger("sandbox.lease_manager")
@@ -51,6 +52,10 @@ class LeaseBackend(ABC):
 
     @abstractmethod
     async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
+        pass
+
+    @abstractmethod
+    async def quarantine_lease(self, session_id: str, reason: str = "") -> bool:
         pass
 
     @abstractmethod
@@ -217,6 +222,18 @@ class SQLiteLeaseBackend(LeaseBackend):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    workspace_id TEXT,
+                    event_type TEXT,
+                    details TEXT,
+                    created_at REAL
+                )
+                """
+            )
             conn.commit()
 
     async def create_or_renew_lease(
@@ -274,30 +291,39 @@ class SQLiteLeaseBackend(LeaseBackend):
     def _sync_claim_expired_leases(self, cutoff_time: float) -> List[LeaseRecord]:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at < ?",
-                (cutoff_time,),
+                "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE (status = 'active' AND expires_at < ?) OR (status = 'reclaiming' AND expires_at < ?)",
+                (cutoff_time, cutoff_time - 60.0),
             )
             rows = cursor.fetchall()
             if rows:
                 conn.execute(
-                    "UPDATE leases SET status = 'reclaiming' WHERE status = 'active' AND expires_at < ?",
-                    (cutoff_time,),
+                    "UPDATE leases SET status = 'reclaiming' WHERE (status = 'active' AND expires_at < ?) OR (status = 'reclaiming' AND expires_at < ?)",
+                    (cutoff_time, cutoff_time - 60.0),
                 )
                 conn.commit()
-            return [
-                LeaseRecord(
-                    session_id=r[0],
-                    workspace_id=r[1],
-                    sandbox_id=r[2],
-                    endpoint=r[3],
-                    created_at=r[4],
-                    expires_at=r[5],
-                    status="reclaiming",
-                    auth_token=r[7] if len(r) > 7 else None,
-                    tenant_id=r[8] if len(r) > 8 and r[8] else "default",
+            records = []
+            for r in rows:
+                try:
+                    dec_token = decrypt_token(r[7]) if len(r) > 7 and r[7] else None
+                except Exception as e:
+                    logger.error("Failed to decrypt auth_token for expired lease '%s', quarantining: %s", r[0], e)
+                    self._sync_quarantine_lease(r[0], reason=f"decryption_error: {e}")
+                    LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                    continue
+                records.append(
+                    LeaseRecord(
+                        session_id=r[0],
+                        workspace_id=r[1],
+                        sandbox_id=r[2],
+                        endpoint=r[3],
+                        created_at=r[4],
+                        expires_at=r[5],
+                        status="reclaiming",
+                        auth_token=dec_token,
+                        tenant_id=r[8] if len(r) > 8 and r[8] else "default",
+                    )
                 )
-                for r in rows
-            ]
+            return records
 
     async def log_audit_event(
         self,
@@ -423,6 +449,22 @@ class SQLiteLeaseBackend(LeaseBackend):
                 for r in rows
             ]
 
+    def _sync_quarantine_lease(self, session_id: str, reason: str = "") -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("UPDATE leases SET status = 'quarantined' WHERE session_id = ?", (session_id,))
+            updated = cursor.rowcount > 0
+            if updated:
+                conn.execute("DELETE FROM workspace_locks WHERE session_id = ?", (session_id,))
+                conn.execute(
+                    "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES (?, '', 'lease_quarantined', ?, ?)",
+                    (session_id, json.dumps({"reason": reason}), time.time()),
+                )
+            conn.commit()
+            return updated
+
+    async def quarantine_lease(self, session_id: str, reason: str = "") -> bool:
+        return await asyncio.to_thread(self._sync_quarantine_lease, session_id, reason)
+
     async def list_active_leases(self) -> List[LeaseRecord]:
         return await asyncio.to_thread(self._sync_list_active)
 
@@ -434,20 +476,29 @@ class SQLiteLeaseBackend(LeaseBackend):
                 (now,),
             )
             rows = cursor.fetchall()
-            return [
-                LeaseRecord(
-                    session_id=r[0],
-                    workspace_id=r[1],
-                    sandbox_id=r[2],
-                    endpoint=r[3],
-                    created_at=r[4],
-                    expires_at=r[5],
-                    status=r[6],
-                    auth_token=r[7] if len(r) > 7 else None,
-                    tenant_id=r[8] if len(r) > 8 and r[8] else "default",
+            records = []
+            for r in rows:
+                try:
+                    dec_token = decrypt_token(r[7]) if len(r) > 7 and r[7] else None
+                except Exception as e:
+                    logger.error("Failed to decrypt auth_token for active lease '%s', quarantining: %s", r[0], e)
+                    self._sync_quarantine_lease(r[0], reason=f"decryption_error: {e}")
+                    LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                    continue
+                records.append(
+                    LeaseRecord(
+                        session_id=r[0],
+                        workspace_id=r[1],
+                        sandbox_id=r[2],
+                        endpoint=r[3],
+                        created_at=r[4],
+                        expires_at=r[5],
+                        status=r[6],
+                        auth_token=dec_token,
+                        tenant_id=r[8] if len(r) > 8 and r[8] else "default",
+                    )
                 )
-                for r in rows
-            ]
+            return records
 
     # Concurrency Lock Implementations (scoped to tenant_id and workspace_id)
     async def acquire_workspace_lock(
@@ -840,6 +891,19 @@ class RedisLeaseBackend(LeaseBackend):
                 pass
         return True
 
+    async def quarantine_lease(self, session_id: str, reason: str = "") -> bool:
+        await self.redis.srem("leases:active", session_id)
+        raw = await self.redis.get(f"lease:{session_id}")
+        if raw:
+            try:
+                data = json.loads(raw)
+                data["status"] = "quarantined"
+                await self.redis.set(f"lease:{session_id}", json.dumps(data))
+                return True
+            except Exception:
+                pass
+        return False
+
     async def list_active_leases(self) -> List[LeaseRecord]:
         active_ids = await self.redis.smembers("leases:active")
         leases = []
@@ -1160,7 +1224,7 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=decrypt_token(row["auth_token"]),
+                auth_token=auth_token,
                 tenant_id=row.get("tenant_id") or "default",
             )
 
@@ -1180,6 +1244,17 @@ class PostgresLeaseBackend(LeaseBackend):
             )
             if not row:
                 return None
+            try:
+                dec_token = decrypt_token(row["auth_token"])
+            except Exception as e:
+                logger.error(
+                    "Failed to decrypt auth_token for heartbeat lease '%s', quarantining row: %s",
+                    session_id,
+                    e,
+                )
+                await self.quarantine_lease(session_id, reason=f"decryption_error: {e}")
+                LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                return None
             return LeaseRecord(
                 session_id=row["session_id"],
                 workspace_id=row["workspace_id"],
@@ -1188,7 +1263,7 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=decrypt_token(row["auth_token"]),
+                auth_token=dec_token,
                 tenant_id=row.get("tenant_id") or "default",
             )
 
@@ -1200,6 +1275,17 @@ class PostgresLeaseBackend(LeaseBackend):
             )
             if not row:
                 return None
+            try:
+                dec_token = decrypt_token(row["auth_token"])
+            except Exception as e:
+                logger.error(
+                    "Failed to decrypt auth_token for lease '%s', quarantining row: %s",
+                    session_id,
+                    e,
+                )
+                await self.quarantine_lease(session_id, reason=f"decryption_error: {e}")
+                LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                return None
             return LeaseRecord(
                 session_id=row["session_id"],
                 workspace_id=row["workspace_id"],
@@ -1208,7 +1294,7 @@ class PostgresLeaseBackend(LeaseBackend):
                 created_at=row["created_at"],
                 expires_at=row["expires_at"],
                 status=row["status"],
-                auth_token=decrypt_token(row["auth_token"]),
+                auth_token=dec_token,
                 tenant_id=row.get("tenant_id") or "default",
             )
 
@@ -1241,25 +1327,39 @@ class PostgresLeaseBackend(LeaseBackend):
                 """
                 UPDATE leases
                 SET status = 'reclaiming'
-                WHERE status = 'active' AND expires_at < $1
+                WHERE (status = 'active' AND expires_at < $1)
+                   OR (status = 'reclaiming' AND expires_at < $1 - 60.0)
                 RETURNING session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id
                 """,
                 cutoff_time,
             )
-            return [
-                LeaseRecord(
-                    session_id=r["session_id"],
-                    workspace_id=r["workspace_id"],
-                    sandbox_id=r["sandbox_id"],
-                    endpoint=r["endpoint"],
-                    created_at=r["created_at"],
-                    expires_at=r["expires_at"],
-                    status=r["status"],
-                    auth_token=decrypt_token(r["auth_token"]),
-                    tenant_id=r.get("tenant_id") or "default",
+            records = []
+            for r in rows:
+                try:
+                    dec_token = decrypt_token(r["auth_token"])
+                except Exception as e:
+                    logger.error(
+                        "Failed to decrypt auth_token for expired lease '%s', quarantining row: %s",
+                        r["session_id"],
+                        e,
+                    )
+                    await self.quarantine_lease(r["session_id"], reason=f"decryption_error: {e}")
+                    LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                    continue
+                records.append(
+                    LeaseRecord(
+                        session_id=r["session_id"],
+                        workspace_id=r["workspace_id"],
+                        sandbox_id=r["sandbox_id"],
+                        endpoint=r["endpoint"],
+                        created_at=r["created_at"],
+                        expires_at=r["expires_at"],
+                        status=r["status"],
+                        auth_token=dec_token,
+                        tenant_id=r.get("tenant_id") or "default",
+                    )
                 )
-                for r in rows
-            ]
+            return records
 
     async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         async with self._pool.acquire() as conn:
@@ -1288,6 +1388,25 @@ class PostgresLeaseBackend(LeaseBackend):
                 return True
             return False
 
+    async def quarantine_lease(self, session_id: str, reason: str = "") -> bool:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE leases SET status = 'quarantined' WHERE session_id = $1 RETURNING workspace_id, tenant_id",
+                session_id,
+            )
+            if row:
+                ws_id = row["workspace_id"]
+                await conn.execute("DELETE FROM workspace_locks WHERE session_id = $1", session_id)
+                await conn.execute(
+                    "INSERT INTO session_audit_logs (session_id, workspace_id, event_type, details, created_at) VALUES ($1, $2, 'lease_quarantined', $3, $4)",
+                    session_id,
+                    ws_id or "",
+                    json.dumps({"reason": reason}),
+                    time.time(),
+                )
+                return True
+            return False
+
     async def list_active_leases(self) -> List[LeaseRecord]:
         now = time.time()
         async with self._pool.acquire() as conn:
@@ -1295,20 +1414,33 @@ class PostgresLeaseBackend(LeaseBackend):
                 "SELECT session_id, workspace_id, sandbox_id, endpoint, created_at, expires_at, status, auth_token, tenant_id FROM leases WHERE status = 'active' AND expires_at >= $1",
                 now,
             )
-            return [
-                LeaseRecord(
-                    session_id=r["session_id"],
-                    workspace_id=r["workspace_id"],
-                    sandbox_id=r["sandbox_id"],
-                    endpoint=r["endpoint"],
-                    created_at=r["created_at"],
-                    expires_at=r["expires_at"],
-                    status=r["status"],
-                    auth_token=decrypt_token(r["auth_token"]),
-                    tenant_id=r.get("tenant_id") or "default",
+            records = []
+            for r in rows:
+                try:
+                    dec_token = decrypt_token(r["auth_token"])
+                except Exception as e:
+                    logger.error(
+                        "Failed to decrypt auth_token for active lease '%s', quarantining row: %s",
+                        r["session_id"],
+                        e,
+                    )
+                    await self.quarantine_lease(r["session_id"], reason=f"decryption_error: {e}")
+                    LEASE_QUARANTINE_TOTAL.labels(reason="decryption_error").inc()
+                    continue
+                records.append(
+                    LeaseRecord(
+                        session_id=r["session_id"],
+                        workspace_id=r["workspace_id"],
+                        sandbox_id=r["sandbox_id"],
+                        endpoint=r["endpoint"],
+                        created_at=r["created_at"],
+                        expires_at=r["expires_at"],
+                        status=r["status"],
+                        auth_token=dec_token,
+                        tenant_id=r.get("tenant_id") or "default",
+                    )
                 )
-                for r in rows
-            ]
+            return records
 
     async def log_audit_event(
         self,
@@ -1672,6 +1804,11 @@ class LeaseManager:
 
     async def mark_expired(self, session_id: str, from_status: Optional[str] = None) -> bool:
         return await self._backend.mark_expired(session_id, from_status=from_status)
+
+    async def quarantine_lease(self, session_id: str, reason: str = "") -> bool:
+        if hasattr(self._backend, "quarantine_lease"):
+            return await self._backend.quarantine_lease(session_id, reason=reason)
+        return False
 
     async def list_active(self) -> List[LeaseRecord]:
         return await self._backend.list_active_leases()

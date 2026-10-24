@@ -61,3 +61,11 @@ POD_CREATE_DURATION_SECONDS = Histogram(
     ["driver"],
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0],
 )
+
+# 6. Lease Quarantines & Decryption Errors
+LEASE_QUARANTINE_TOTAL = Counter(
+    "sandbox_lease_quarantine_total",
+    "Total number of leases quarantined due to decryption or corruption errors",
+    ["reason"],  # e.g., "decryption_error"
+)
+LEASE_DECRYPTION_ERRORS_TOTAL = LEASE_QUARANTINE_TOTAL

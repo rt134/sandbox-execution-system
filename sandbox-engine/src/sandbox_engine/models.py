@@ -52,7 +52,7 @@ class LeaseRecord(BaseModel):
     endpoint: str
     created_at: float
     expires_at: float
-    status: Literal["active", "expired", "released", "reclaiming"] = "active"
+    status: Literal["active", "expired", "released", "reclaiming", "quarantined"] = "active"
     auth_token: Optional[str] = None
     tenant_id: str = "default"
 

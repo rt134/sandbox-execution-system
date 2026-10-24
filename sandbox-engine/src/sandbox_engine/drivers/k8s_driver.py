@@ -224,6 +224,17 @@ class KubernetesDriver(ContainerDriver):
 
         runtime_class = settings.k8s_runtime_class
         if not runtime_class or runtime_class.strip().lower() in ("none", "runc", ""):
+            if settings.environment.lower() in ("production", "prod") and not (
+                getattr(settings, "allow_insecure_k8s_runtime", False)
+                or os.environ.get("ALLOW_INSECURE_K8S_RUNTIME", "").strip().lower() in ("1", "true", "yes")
+                or os.environ.get("SANDBOX_ALLOW_INSECURE_K8S_RUNTIME", "").strip().lower() in ("1", "true", "yes")
+            ):
+                raise ValueError(
+                    f"Production environment with SANDBOX_DRIVER=k8s requires a secure runtime class "
+                    f"(e.g. 'gvisor'), got '{settings.k8s_runtime_class}'. "
+                    "Refusing to run sandboxes with host kernel access on runc. "
+                    "Set SANDBOX_K8S_RUNTIME_CLASS=gvisor or set ALLOW_INSECURE_K8S_RUNTIME=1 to explicitly override."
+                )
             runtime_class = None
 
         pod_spec_kwargs = dict(

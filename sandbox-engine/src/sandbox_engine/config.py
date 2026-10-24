@@ -220,6 +220,17 @@ class EngineSettings(BaseSettings):
                     "Docker driver is supported for local development and testing only. "
                     "Set SANDBOX_DRIVER=k8s or set ALLOW_INSECURE_DOCKER_PRODUCTION=1 to explicitly override."
                 )
+            if self.driver == "k8s":
+                rc = (self.k8s_runtime_class or "").strip().lower()
+                if (not rc or rc in ("none", "runc")) and not (
+                    self.allow_insecure_k8s_runtime or _allow_insecure_k8s_runtime()
+                ):
+                    raise ValueError(
+                        f"Production environment with SANDBOX_DRIVER=k8s requires a secure runtime class "
+                        f"(e.g. 'gvisor'), got '{self.k8s_runtime_class}'. "
+                        "Refusing to run sandboxes with host kernel access on runc. "
+                        "Set SANDBOX_K8S_RUNTIME_CLASS=gvisor or set ALLOW_INSECURE_K8S_RUNTIME=1 to explicitly override."
+                    )
 
     # Egress Proxy Configurations (Squid)
     http_proxy: Optional[str] = None
@@ -239,6 +250,7 @@ class EngineSettings(BaseSettings):
     k8s_node_selector_value: str = "true"
     k8s_use_pvc: bool = False
     k8s_storage_class: Optional[str] = None
+    allow_insecure_k8s_runtime: bool = False
 
     # Engine Server Settings
     host: str = "0.0.0.0"
@@ -254,6 +266,14 @@ class EngineSettings(BaseSettings):
 
 def _allow_insecure_docker_production() -> bool:
     raw = os.environ.get("ALLOW_INSECURE_DOCKER_PRODUCTION", "").strip().lower()
+    return raw in ("1", "true", "yes")
+
+
+def _allow_insecure_k8s_runtime() -> bool:
+    raw = (
+        os.environ.get("ALLOW_INSECURE_K8S_RUNTIME", "").strip().lower()
+        or os.environ.get("SANDBOX_ALLOW_INSECURE_K8S_RUNTIME", "").strip().lower()
+    )
     return raw in ("1", "true", "yes")
 
 
